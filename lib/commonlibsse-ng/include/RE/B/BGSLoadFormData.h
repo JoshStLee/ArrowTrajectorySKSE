@@ -1,0 +1,53 @@
+#pragma once
+
+namespace RE
+{
+	class TESForm;
+	class TESObjectREFR;
+
+	class BGSLoadFormData
+	{
+	public:
+		inline static constexpr auto RTTI = RTTI_BGSLoadFormData;
+
+		enum class Flags
+		{
+			kSkipForm = 1 << 0,
+			kFormPending = 1 << 1,
+			kRevertOnly = 1 << 2,
+			kConstructedForm = 1 << 3,
+			kCellChanged = 1 << 4,
+			kLoadingPackageFromExtraData = 1 << 5
+		};
+
+		[[nodiscard]] TESForm* GetForm()
+		{
+			using func_t = decltype(&BGSLoadFormData::GetForm);
+			static REL::Relocation<func_t> func{ RELOCATION_ID(35095, 35987) };
+			return func(this);
+		}
+
+		[[nodiscard]] TESObjectREFR* GetReference()
+		{
+			using func_t = decltype(&BGSLoadFormData::GetReference);
+			static REL::Relocation<func_t> func{ RELOCATION_ID(35096, 35988) };
+			return func(this);
+		}
+
+		// members
+		FormID                             formID;            // 00
+		std::uint32_t                      size;              // 04
+		std::uint32_t                      uncompressedSize;  // 08
+		std::uint32_t                      pad0C;             // 0C
+		TESForm*                           form;              // 10
+		std::uint32_t                      changeFlags;       // 18
+		std::uint32_t                      oldChangeFlags;    // 1C
+		REX::EnumSet<Flags, std::uint16_t> flags;             // 20
+		std::uint8_t                       pad22;             // 22
+		std::uint8_t                       version;           // 23
+	};
+	static_assert(offsetof(BGSLoadFormData, form) == 0x10);
+	static_assert(offsetof(BGSLoadFormData, flags) == 0x20);
+	static_assert(offsetof(BGSLoadFormData, version) == 0x23);
+	static_assert(sizeof(BGSLoadFormData) == 0x28);
+}
