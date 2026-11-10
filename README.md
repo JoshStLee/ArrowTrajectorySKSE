@@ -2,6 +2,12 @@
 
 A minimal SKSE plugin template for Skyrim SE/AE using CommonLibSSE-NG. It does not include PrismaUI or enable Skyrim VR.
 
+# Current feature milestone
+
+While a bow or crossbow is drawn, the plugin predicts the arrow's ballistic path, draws that path as a HUD overlay, and moves the vanilla HUD crosshair to the predicted impact point when the path hits something. Combat spells use a straight camera ray and move the same HUD crosshair to the raycast hit.
+
+This milestone uses the vanilla HUD reticle. SmoothCam's selectable 3D crosshair styles are not included yet.
+
 # Requires ClibDT for the sake of your glutes
 # Getting Started
 ClibDT (https://www.nexusmods.com/skyrimspecialedition/mods/154240)

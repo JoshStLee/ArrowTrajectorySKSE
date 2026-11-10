@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "trajectory.h"
 
 static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
 {
@@ -23,6 +24,10 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 
     SKSE::Init(a_skse);
     SKSE::AllocTrampoline(1 << 10);
+
+    if (!Trajectory::Install()) {
+        return false;
+    }
 
     g_messaging->RegisterListener("SKSE", SKSEMessageHandler);
 

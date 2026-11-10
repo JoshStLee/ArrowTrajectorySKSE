@@ -27,7 +27,7 @@ target('ArrowTrajectory')
     add_rules('commonlibsse-ng.plugin', {
         name        = 'ArrowTrajectory',
         author      = 'LeStLee',
-        description = 'An attempt to turn Smoothcam feature into its own mod'
+        description = 'Standalone ballistic trajectory and raycast crosshair plugin'
     })
 
     add_files('src/**.cpp')
