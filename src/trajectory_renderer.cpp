@@ -52,7 +52,6 @@ namespace
     bool g_installFailureReported = false;
     bool g_presentReported = false;
     bool g_drawReported = false;
-    bool g_depthTargetReported = false;
 
     template <class T>
     void Release(T*& object)
@@ -310,12 +309,6 @@ namespace
         REX::W32::ID3D11RenderTargetView* renderTarget = nullptr;
         REX::W32::ID3D11DepthStencilView* depthTarget = nullptr;
         g_context->OMGetRenderTargets(1, &renderTarget, &depthTarget);
-        if (!g_depthTargetReported) {
-            logger::info(
-                "Trajectory depth occlusion is {} at Present.",
-                depthTarget ? "available" : "unavailable");
-            g_depthTargetReported = true;
-        }
         if (!renderTarget) {
             if (!g_drawReported) {
                 logger::warn("Trajectory Direct3D draw skipped: Present has no bound render target.");

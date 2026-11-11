@@ -136,6 +136,21 @@ namespace
         return { pitch, yaw };
     }
 
+    CameraRotation GetSmoothCamCameraRotation(const RE::NiQuaternion& quaternion)
+    {
+        constexpr float halfPi = 1.57079632679489661923f;
+        return {
+            -std::atan2(
+                2.0f * (quaternion.y * quaternion.z + quaternion.w * quaternion.x),
+                quaternion.w * quaternion.w - quaternion.x * quaternion.x -
+                    quaternion.y * quaternion.y + quaternion.z * quaternion.z) - halfPi,
+            -std::atan2(
+                2.0f * (quaternion.x * quaternion.y + quaternion.w * quaternion.z),
+                quaternion.w * quaternion.w + quaternion.x * quaternion.x -
+                    quaternion.y * quaternion.y - quaternion.z * quaternion.z)
+        };
+    }
+
     RE::NiPoint3 ToNi(const PhysicsVector& point)
     {
         return { point.x, point.y, point.z };
@@ -420,10 +435,8 @@ namespace
             ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
             : nullptr;
         const auto cameraRotation = GetSmoothCamCameraRotation(camera->world.rotate);
-        const auto cameraForward = Normalize(ToVector(camera->world.rotate.GetVectorY()));
         auto aimRotation = cameraRotation;
-        aimRotation.pitch = -std::asin(std::clamp(cameraForward.z, -1.0f, 1.0f));
-        aimRotation.yaw = std::atan2(cameraForward.x, cameraForward.y);
+        aimRotation.pitch = -cameraRotation.pitch - 1.57079632679489661923f;
         if (thirdPersonState && thirdPersonState->freeRotationEnabled) {
             aimRotation.yaw = player->GetAngleZ();
         }
@@ -442,12 +455,9 @@ namespace
         };
         if (!g_reportedAimParameters) {
             logger::info(
-                "Camera-forward bow aim: renderPitch={:.4f}, renderYaw={:.4f}, forward=({:.4f}, {:.4f}, {:.4f}), aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
+                "SmoothCam-matched bow aim: renderPitch={:.4f}, renderYaw={:.4f}, aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
                 cameraRotation.pitch,
                 cameraRotation.yaw,
-                cameraForward.x,
-                cameraForward.y,
-                cameraForward.z,
                 aimRotation.pitch,
                 aimRotation.yaw,
                 projectilePitch,
