@@ -1,9 +1,13 @@
 #include "pch.h"
 #include "trajectory.h"
+#include "trajectory_renderer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -26,15 +30,33 @@ namespace
         }
     };
 
-    using CameraUpdate = void (*)(RE::PlayerCamera*);
+    struct CameraRotation
+    {
+        float pitch;
+        float yaw;
+    };
 
-    CameraUpdate g_originalCameraUpdate = nullptr;
+    using CameraStateUpdate = void (*)(RE::TESCameraState*, RE::BSTSmartPointer<RE::TESCameraState>&);
+
+    std::unordered_map<std::uintptr_t, CameraStateUpdate> g_originalCameraStateUpdates;
+    bool g_attackInputHeld = false;
+    bool g_attackInputListenerRegistered = false;
     RE::GFxMovieView* g_hudMovie = nullptr;
-    RE::GFxValue g_trajectoryClip;
     double g_crosshairBaseX = 0.0;
     double g_crosshairBaseY = 0.0;
     bool g_crosshairBaseCaptured = false;
-    bool g_reportedDrawingFailure = false;
+    bool g_reportedFirstPath = false;
+    bool g_reportedFirstPrediction = false;
+    bool g_reportedPredictionFailure = false;
+    bool g_reportedPredictionMiss = false;
+    bool g_reportedAimParameters = false;
+    bool g_reportedFirstUpdate = false;
+    bool g_reportedCombatState = false;
+    bool g_reportedNoAmmo = false;
+    std::uint64_t g_lastBowStateDiagnostic = 0;
+    bool g_hasBowStateDiagnostic = false;
+    bool g_lastAttackHeldDiagnostic = false;
+    std::chrono::steady_clock::time_point g_lastStateHeartbeat{};
 
     constexpr float kStep = 1.0f / 20.0f;
     constexpr float kMaxRange = 12000.0f;
@@ -49,9 +71,69 @@ namespace
         float unknown[3];
     };
 
+    bool HasBowOrCrossbow(const RE::Actor* actor);
+    bool IsBowOrCrossbow(const RE::Actor* actor);
+
+    class AttackInputSink final : public RE::BSTEventSink<RE::InputEvent*>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(
+            RE::InputEvent* const* event,
+            RE::BSTEventSource<RE::InputEvent*>*) override
+        {
+            if (!event || !*event) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            const auto userEvents = RE::UserEvents::GetSingleton();
+            if (!userEvents) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            for (auto* current = *event; current; current = current->next) {
+                if (current->GetEventType() != RE::INPUT_EVENT_TYPE::kButton) {
+                    continue;
+                }
+                const auto button = current->AsButtonEvent();
+                if (!button ||
+                    std::strcmp(button->QUserEvent().c_str(), userEvents->rightAttack.c_str()) != 0)
+                {
+                    continue;
+                }
+
+                const bool held = button->IsPressed();
+                if (held) {
+                    const auto player = RE::PlayerCharacter::GetSingleton();
+                    const auto ammo = player ? player->GetCurrentAmmo() : nullptr;
+                    if (!player || !HasBowOrCrossbow(player) || !ammo || !ammo->data.projectile) {
+                        continue;
+                    }
+                }
+                if (held != g_attackInputHeld) {
+                    g_attackInputHeld = held;
+                    logger::info("Mapped bow attack input is {}.", held ? "held" : "released");
+                }
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    AttackInputSink g_attackInputSink;
+
     PhysicsVector ToVector(const RE::NiPoint3& point)
     {
         return { point.x, point.y, point.z };
+    }
+
+    CameraRotation GetSmoothCamCameraRotation(const RE::NiMatrix3& matrix)
+    {
+        constexpr float halfPi = 1.57079632679489661923f;
+        const auto a = std::clamp(-matrix.entry[2][0], -1.0f, 1.0f);
+        const auto pitch = std::clamp(std::asin(a), -halfPi, halfPi) - halfPi;
+        const auto yaw = matrix.entry[0][0] <= 0.001f || matrix.entry[2][2] <= 0.001f
+            ? std::atan2(matrix.entry[0][2], matrix.entry[1][2]) - halfPi
+            : std::atan2(matrix.entry[0][0], matrix.entry[1][0]);
+        return { pitch, yaw };
     }
 
     RE::NiPoint3 ToNi(const PhysicsVector& point)
@@ -155,17 +237,86 @@ namespace
             spell->GetCastingType() != RE::MagicSystem::CastingType::kConstantEffect;
     }
 
+    bool HasBowOrCrossbow(const RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+        const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
+        const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
+        const auto isRanged = [](const RE::TESObjectWEAP* weapon) {
+            return weapon &&
+                (weapon->weaponData.animationType == RE::WEAPON_TYPE::kBow ||
+                 weapon->weaponData.animationType == RE::WEAPON_TYPE::kCrossbow);
+        };
+        return isRanged(rightWeapon) || isRanged(leftWeapon);
+    }
+
     bool IsBowOrCrossbow(const RE::Actor* actor)
     {
-        if (!actor->IsWeaponDrawn()) {
+        if (!HasBowOrCrossbow(actor)) {
             return false;
         }
-        const auto weapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
-        if (!weapon) {
+        const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
+        const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
+        const auto hasWeaponType = [](const RE::TESObjectWEAP* weapon, RE::WEAPON_TYPE type) {
+            return weapon && weapon->weaponData.animationType == type;
+        };
+        const bool isCrossbow =
+            hasWeaponType(rightWeapon, RE::WEAPON_TYPE::kCrossbow) ||
+            hasWeaponType(leftWeapon, RE::WEAPON_TYPE::kCrossbow);
+        const bool hasBow =
+            isCrossbow ||
+            hasWeaponType(rightWeapon, RE::WEAPON_TYPE::kBow) ||
+            hasWeaponType(leftWeapon, RE::WEAPON_TYPE::kBow);
+        if (!hasBow) {
             return false;
         }
-        const auto type = weapon->weaponData.animationType;
-        return type == RE::WEAPON_TYPE::kBow || type == RE::WEAPON_TYPE::kCrossbow;
+
+        std::uint32_t movementBits = 0;
+        std::memcpy(&movementBits, std::addressof(actor->actorState1), sizeof(movementBits));
+        const bool bowDrawn = (movementBits & (1u << 31)) != 0;
+        const bool crossbowReady = (movementBits & (1u << 29)) != 0;
+        const bool aiming = g_attackInputHeld || (bowDrawn && (!isCrossbow || crossbowReady));
+        const auto weaponState = static_cast<std::uint8_t>(actor->GetWeaponState());
+        const auto attackState = static_cast<std::uint8_t>(actor->GetAttackState());
+        const auto rightType = rightWeapon ? rightWeapon->weaponData.animationType.underlying() : 0xFF;
+        const auto leftType = leftWeapon ? leftWeapon->weaponData.animationType.underlying() : 0xFF;
+        const std::uint64_t diagnosticState =
+            static_cast<std::uint64_t>(movementBits) |
+            (static_cast<std::uint64_t>(weaponState) << 32) |
+            (static_cast<std::uint64_t>(attackState) << 40) |
+            (static_cast<std::uint64_t>(rightType) << 48) |
+            (static_cast<std::uint64_t>(leftType) << 56);
+        const auto now = std::chrono::steady_clock::now();
+        const bool stateChanged =
+            !g_hasBowStateDiagnostic ||
+            diagnosticState != g_lastBowStateDiagnostic ||
+            g_attackInputHeld != g_lastAttackHeldDiagnostic;
+        const bool heartbeatElapsed =
+            g_lastStateHeartbeat.time_since_epoch().count() == 0 ||
+            now - g_lastStateHeartbeat >= std::chrono::seconds(5);
+        if (stateChanged || heartbeatElapsed) {
+            logger::info(
+                "Ranged weapon state: rightType={}, leftType={}, actionBits=0x{:08X}, attack={}, weapon={}, drawn={}, bowBit={}, crossbowBit={}, mappedAttackHeld={}, aiming={}, reason={}.",
+                rightWeapon ? static_cast<int>(rightType) : -1,
+                leftWeapon ? static_cast<int>(leftType) : -1,
+                movementBits,
+                static_cast<int>(attackState),
+                static_cast<int>(weaponState),
+                actor->IsWeaponDrawn(),
+                bowDrawn,
+                crossbowReady,
+                g_attackInputHeld,
+                aiming,
+                stateChanged ? "changed" : "5s heartbeat");
+            g_lastBowStateDiagnostic = diagnosticState;
+            g_lastAttackHeldDiagnostic = g_attackInputHeld;
+            g_hasBowStateDiagnostic = true;
+            g_lastStateHeartbeat = now;
+        }
+
+        return aiming;
     }
 
     bool IsCombatMagicDrawn(const RE::Actor* actor)
@@ -215,13 +366,33 @@ namespace
         const RE::BSFixedString weaponName("WEAPON");
         const RE::BSFixedString arrowName("Arrow:0");
         const RE::BSFixedString rightMagazineName("NPC R MagicNode [RMag]");
+        const RE::BSFixedString leftMagazineName("NPC L MagicNode [LMag]");
+
+        const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
+        const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
+        const auto isCrossbow = [](const RE::TESObjectWEAP* weapon) {
+            return weapon && weapon->weaponData.animationType == RE::WEAPON_TYPE::kCrossbow;
+        };
+        if (isCrossbow(rightWeapon) || isCrossbow(leftWeapon)) {
+            if (auto* magazine = root->GetObjectByName(rightMagazineName)) {
+                if (auto* arrow = magazine->GetObjectByName(arrowName)) {
+                    return arrow;
+                }
+                return magazine;
+            }
+        }
 
         if (auto* weapon = root->GetObjectByName(weaponName)) {
-            if (auto* arrow = weapon->GetObjectByName(arrowName)) {
-                return arrow;
+            if (weapon->GetObjectByName(arrowName)) {
+                return weapon;
             }
         }
         if (auto* magazine = root->GetObjectByName(rightMagazineName)) {
+            if (auto* arrow = magazine->GetObjectByName(arrowName)) {
+                return arrow;
+            }
+        }
+        if (auto* magazine = root->GetObjectByName(leftMagazineName)) {
             if (auto* arrow = magazine->GetObjectByName(arrowName)) {
                 return arrow;
             }
@@ -231,34 +402,81 @@ namespace
 
     bool SimulateArrow(
         RE::PlayerCharacter* player,
+        RE::PlayerCamera* playerCamera,
         RE::NiCamera* camera,
         std::vector<RE::NiPoint3>& path,
-        PhysicsVector& impact)
+        PhysicsVector& impact,
+        const char*& failureReason)
     {
+        failureReason = nullptr;
         const auto ammo = player->GetCurrentAmmo();
         const auto projectile = ammo ? ammo->data.projectile : nullptr;
         if (!projectile || projectile->data.speed <= 0.0f) {
+            failureReason = "current ammo has no projectile or a non-positive projectile speed";
             return false;
         }
 
-        auto direction = ToVector(camera->world.rotate.GetVectorY());
-        if (Dot(direction, direction) <= 0.0001f) {
-            return false;
+        const auto thirdPersonState = playerCamera
+            ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
+            : nullptr;
+        const auto cameraRotation = GetSmoothCamCameraRotation(camera->world.rotate);
+        const auto cameraForward = Normalize(ToVector(camera->world.rotate.GetVectorY()));
+        auto aimRotation = cameraRotation;
+        aimRotation.pitch = -std::asin(std::clamp(cameraForward.z, -1.0f, 1.0f));
+        aimRotation.yaw = std::atan2(cameraForward.x, cameraForward.y);
+        if (thirdPersonState && thirdPersonState->freeRotationEnabled) {
+            aimRotation.yaw = player->GetAngleZ();
         }
 
         float tiltRadians = 0.0f;
         if (const auto* setting = RE::INISettingCollection::GetSingleton()->GetSetting("f3PArrowTiltUpAngle:Combat")) {
             tiltRadians = setting->GetFloat() * 0.017453292519943295f;
         }
-        RE::NiMatrix3 tilt;
-        tilt.MakeXRotation(tiltRadians);
-        direction = ToVector(camera->world.rotate * (tilt * RE::NiPoint3(0.0f, 1.0f, 0.0f)));
-        direction = Normalize(direction);
-
-        auto start = camera->world.translate;
-        if (const auto* arrowNode = FindArrowNode(player)) {
-            start = arrowNode->world.translate;
+        auto projectilePitch = aimRotation.pitch - tiltRadians;
+        projectilePitch *= -1.0f;
+        const auto pitchCos = std::cos(projectilePitch);
+        const auto direction = PhysicsVector{
+            pitchCos * std::sin(aimRotation.yaw),
+            pitchCos * std::cos(aimRotation.yaw),
+            std::sin(projectilePitch)
+        };
+        if (!g_reportedAimParameters) {
+            logger::info(
+                "Camera-forward bow aim: renderPitch={:.4f}, renderYaw={:.4f}, forward=({:.4f}, {:.4f}, {:.4f}), aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
+                cameraRotation.pitch,
+                cameraRotation.yaw,
+                cameraForward.x,
+                cameraForward.y,
+                cameraForward.z,
+                aimRotation.pitch,
+                aimRotation.yaw,
+                projectilePitch,
+                direction.x,
+                direction.y,
+                direction.z);
+            g_reportedAimParameters = true;
         }
+
+        const auto arrowNode = FindArrowNode(player);
+        if (!arrowNode) {
+            failureReason = "could not find the bow arrow or hand/magazine node in the player's 3D";
+            return false;
+        }
+        const auto player3D = player->Get3D();
+        if (!player3D) {
+            failureReason = "player 3D is unavailable";
+            return false;
+        }
+        const auto playerPosition = player3D->world.translate;
+        const auto arrowOffset = arrowNode->world.translate - playerPosition;
+        const auto yawDelta = player->GetAngleZ() - cameraRotation.yaw;
+        const auto cosine = std::cos(yawDelta);
+        const auto sine = std::sin(yawDelta);
+        const RE::NiPoint3 start{
+            playerPosition.x + cosine * arrowOffset.x - sine * arrowOffset.y,
+            playerPosition.y + sine * arrowOffset.x + cosine * arrowOffset.y,
+            playerPosition.z + arrowOffset.z
+        };
 
         const auto drawStrength = GetBowDrawStrength(player);
         float weaponSpeed = 1.0f;
@@ -305,6 +523,7 @@ namespace
                 break;
             }
         }
+        failureReason = "predicted path did not hit a collision surface";
         return false;
     }
 
@@ -324,7 +543,6 @@ namespace
             return true;
         }
 
-        g_trajectoryClip = RE::GFxValue();
         g_hudMovie = menu->uiMovie.get();
         g_crosshairBaseCaptured = false;
 
@@ -340,15 +558,6 @@ namespace
         g_crosshairBaseX = x.GetNumber();
         g_crosshairBaseY = y.GetNumber();
         g_crosshairBaseCaptured = true;
-
-        RE::GFxValue hudBase;
-        if (!g_hudMovie->GetVariable(&hudBase, "_root.HUDMovieBaseInstance") ||
-            !hudBase.IsDisplayObject() ||
-            !hudBase.CreateEmptyMovieClip(&g_trajectoryClip, "ArrowTrajectorySKSE", 1000))
-        {
-            logger::warn("Unable to create the HUD trajectory drawing layer.");
-            return false;
-        }
         return true;
     }
 
@@ -387,67 +596,18 @@ namespace
             SetCrosshairScreenPosition(menu, x, y);
     }
 
-    void DrawTrajectory(RE::IMenu* menu, RE::NiCamera* camera, const std::vector<RE::NiPoint3>& path)
+    void DrawTrajectory(RE::NiCamera* camera, const std::vector<RE::NiPoint3>& path)
     {
-        if (!menu || !menu->uiMovie || !g_trajectoryClip.IsDisplayObject()) {
-            return;
-        }
-
-        g_trajectoryClip.Invoke("clear");
-        if (path.size() < 2) {
-            RE::GFxValue::DisplayInfo hidden;
-            hidden.SetVisible(false);
-            g_trajectoryClip.SetDisplayInfo(hidden);
-            return;
-        }
-
-        RE::GFxValue::DisplayInfo visible;
-        visible.SetVisible(true);
-        g_trajectoryClip.SetDisplayInfo(visible);
-
-        const std::array<RE::GFxValue, 3> lineStyle{
-            RE::GFxValue(2.0),
-            RE::GFxValue(0xFFD36A),
-            RE::GFxValue(85.0)
-        };
-        if (!g_trajectoryClip.Invoke("lineStyle", lineStyle)) {
-            if (!g_reportedDrawingFailure) {
-                logger::warn("The HUD movie does not support drawing the trajectory overlay.");
-                g_reportedDrawingFailure = true;
-            }
-            return;
-        }
-
-        const auto rect = menu->uiMovie->GetVisibleFrameRect();
-        const auto centerX = (rect.left + rect.right) * 0.5;
-        const auto centerY = (rect.top + rect.bottom) * 0.5;
-        bool drawing = false;
-        for (const auto& point : path) {
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-            if (!camera->WorldPtToScreenPt3(point, x, y, z, 1.0e-5f)) {
-                drawing = false;
-                continue;
-            }
-
-            const std::array<RE::GFxValue, 2> args{
-                RE::GFxValue(static_cast<double>(x) - centerX),
-                RE::GFxValue(static_cast<double>(y) - centerY)
-            };
-            if (!g_trajectoryClip.Invoke(drawing ? "lineTo" : "moveTo", args)) {
-                if (!g_reportedDrawingFailure) {
-                    logger::warn("Unable to draw the trajectory path in the HUD movie.");
-                    g_reportedDrawingFailure = true;
-                }
-                return;
-            }
-            drawing = true;
+        TrajectoryRenderer::Submit(path, camera);
+        if (!g_reportedFirstPath && path.size() > 1) {
+            logger::info("Trajectory world path passed to the Direct3D renderer: {} points.", path.size());
+            g_reportedFirstPath = true;
         }
     }
 
     void ResetHUD(RE::IMenu* menu)
     {
+        TrajectoryRenderer::Clear();
         if (!menu || !menu->uiMovie) {
             return;
         }
@@ -457,29 +617,90 @@ namespace
             (rect.left + rect.right) * 0.5f,
             (rect.top + rect.bottom) * 0.5f);
 
-        if (g_trajectoryClip.IsDisplayObject()) {
-            g_trajectoryClip.Invoke("clear");
-            RE::GFxValue::DisplayInfo hidden;
-            hidden.SetVisible(false);
-            g_trajectoryClip.SetDisplayInfo(hidden);
-        }
     }
 
-    void CameraUpdateHook(RE::PlayerCamera* camera)
+    void CenterCrosshair(RE::IMenu* menu)
     {
-        g_originalCameraUpdate(camera);
-        Trajectory::Update(camera);
+        if (!menu || !menu->uiMovie) {
+            return;
+        }
+        const auto rect = menu->uiMovie->GetVisibleFrameRect();
+        SetCrosshairScreenPosition(
+            menu,
+            (rect.left + rect.right) * 0.5f,
+            (rect.top + rect.bottom) * 0.5f);
+    }
+
+    void CameraStateUpdateHook(
+        RE::TESCameraState* state,
+        RE::BSTSmartPointer<RE::TESCameraState>& nextState)
+    {
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(state);
+        const auto original = g_originalCameraStateUpdates.find(vtableAddress);
+        if (original == g_originalCameraStateUpdates.end()) {
+            logger::error("Camera-state update hook received an unregistered vtable: {:X}.", vtableAddress);
+            return;
+        }
+
+        original->second(state, nextState);
+        TrajectoryRenderer::Install();
+        if (!g_reportedFirstUpdate) {
+            logger::info("Camera-state update hook is running.");
+            g_reportedFirstUpdate = true;
+        }
+        Trajectory::Update(RE::PlayerCamera::GetSingleton());
     }
 }
 
 bool Trajectory::Install()
 {
-    REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_PlayerCamera[0] };
-    g_originalCameraUpdate = reinterpret_cast<CameraUpdate>(vtable.write_vfunc(2, CameraUpdateHook));
-    if (!g_originalCameraUpdate) {
-        logger::critical("Failed to hook PlayerCamera::Update; ArrowTrajectory will not load.");
+    TrajectoryRenderer::Install();
+
+    if (!g_attackInputListenerRegistered) {
+        const auto inputManager = RE::BSInputDeviceManager::GetSingleton();
+        if (!inputManager) {
+            logger::critical("Failed to register attack input listener: input device manager is unavailable.");
+            return false;
+        }
+        inputManager->AddEventSink(&g_attackInputSink);
+        g_attackInputListenerRegistered = true;
+        logger::info("Registered the mapped right-attack input observer.");
+    }
+
+    const auto camera = RE::PlayerCamera::GetSingleton();
+    if (!camera) {
+        logger::critical("Failed to hook camera-state updates: PlayerCamera singleton is unavailable.");
         return false;
     }
+
+    std::size_t hookedVTables = 0;
+    for (const auto& state : camera->GetRuntimeData().cameraStates) {
+        auto* cameraState = state.get();
+        if (!cameraState) {
+            continue;
+        }
+
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(cameraState);
+        if (g_originalCameraStateUpdates.contains(vtableAddress)) {
+            continue;
+        }
+
+        REL::Relocation<std::uintptr_t> vtable{ vtableAddress };
+        const auto original = vtable.write_vfunc(3, CameraStateUpdateHook);
+        if (!original) {
+            logger::critical("Failed to hook camera-state update vtable {:X}.", vtableAddress);
+            return false;
+        }
+        g_originalCameraStateUpdates.emplace(vtableAddress, reinterpret_cast<CameraStateUpdate>(original));
+        ++hookedVTables;
+    }
+
+    if (hookedVTables == 0) {
+        logger::critical("Failed to hook camera-state updates: no initialized camera states were available.");
+        return false;
+    }
+
+    logger::info("Camera-state update hooks installed on {} vtables.", hookedVTables);
     return true;
 }
 
@@ -492,11 +713,21 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     const auto player = RE::PlayerCharacter::GetSingleton();
     auto* menu = GetHUDMenu();
     if (!EnsureHUDState(menu)) {
+        TrajectoryRenderer::Clear();
+        static bool reportedHUDUnavailable = false;
+        if (!reportedHUDUnavailable) {
+            logger::warn("Trajectory update skipped: HUD movie or drawing layer is unavailable.");
+            reportedHUDUnavailable = true;
+        }
         return;
     }
 
     const bool usingBow = IsBowOrCrossbow(player);
     const bool usingMagic = !usingBow && IsCombatMagicDrawn(player);
+    if ((usingBow || usingMagic) && !g_reportedCombatState) {
+        logger::info("Raycast crosshair active: bow={}, combat magic={}.", usingBow, usingMagic);
+        g_reportedCombatState = true;
+    }
     if (!usingBow && !usingMagic) {
         ResetHUD(menu);
         return;
@@ -513,11 +744,34 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     bool hit = false;
     if (usingBow) {
         if (!player->GetCurrentAmmo()) {
+            if (!g_reportedNoAmmo) {
+                logger::warn("Trajectory prediction skipped: no current bow ammo/projectile.");
+                g_reportedNoAmmo = true;
+            }
             ResetHUD(menu);
             return;
         }
-        hit = SimulateArrow(player, worldCamera, path, hitPosition);
-        DrawTrajectory(menu, worldCamera, path);
+        const char* failureReason = nullptr;
+        hit = SimulateArrow(player, camera, worldCamera, path, hitPosition, failureReason);
+        if (path.size() > 1) {
+            DrawTrajectory(worldCamera, path);
+        } else {
+            TrajectoryRenderer::Clear();
+        }
+        if (!g_reportedFirstPrediction) {
+            logger::info(
+                "First bow prediction completed: hit={}, worldPathPoints={}.",
+                hit,
+                path.size());
+            g_reportedFirstPrediction = true;
+        }
+        if (!hit && failureReason && path.empty() && !g_reportedPredictionFailure) {
+            logger::warn("Bow trajectory was not simulated: {}.", failureReason);
+            g_reportedPredictionFailure = true;
+        } else if (!hit && failureReason && !path.empty() && !g_reportedPredictionMiss) {
+            logger::info("Bow trajectory was simulated but no collision was found; drawing the predicted path.");
+            g_reportedPredictionMiss = true;
+        }
     } else {
         const auto direction = ToVector(worldCamera->world.rotate.GetVectorY());
         const auto origin = ToVector(worldCamera->world.translate);
@@ -527,14 +781,14 @@ void Trajectory::Update(RE::PlayerCamera* camera)
                 hit = true;
             }
         }
-        DrawTrajectory(menu, worldCamera, {});
+        DrawTrajectory(worldCamera, {});
     }
 
     if (hit) {
         if (!SetCrosshairPosition(menu, ToNi(hitPosition))) {
-            ResetHUD(menu);
+            CenterCrosshair(menu);
         }
     } else {
-        ResetHUD(menu);
+        CenterCrosshair(menu);
     }
 }

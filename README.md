@@ -4,7 +4,7 @@ A minimal SKSE plugin template for Skyrim SE/AE using CommonLibSSE-NG. It does n
 
 # Current feature milestone
 
-While a bow or crossbow is drawn, the plugin predicts the arrow's ballistic path, draws that path as a HUD overlay, and moves the vanilla HUD crosshair to the predicted impact point when the path hits something. Combat spells use a straight camera ray and move the same HUD crosshair to the raycast hit.
+While the player is actively drawing/holding a bow or crossbow attack with ammunition equipped, the plugin predicts the arrow's ballistic path, draws it as a thick white Direct3D overlay, and moves the vanilla HUD crosshair to the predicted impact point when the path hits something. Combat spells use a straight camera ray and move the same HUD crosshair to the raycast hit.
 
 This milestone uses the vanilla HUD reticle. SmoothCam's selectable 3D crosshair styles are not included yet.
 
