@@ -3,7 +3,6 @@
 #include "trajectory_renderer.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <optional>
@@ -56,20 +55,15 @@ namespace
     double g_crosshairBaseX = 0.0;
     double g_crosshairBaseY = 0.0;
     bool g_crosshairBaseCaptured = false;
-    bool g_reportedFirstPath = false;
-    bool g_reportedFirstPrediction = false;
     bool g_reportedPredictionFailure = false;
     bool g_reportedPredictionMiss = false;
     bool g_reportedPredictionHit = false;
-    bool g_reportedAimParameters = false;
-    bool g_reportedArrowVelocityCorrection = false;
     bool g_reportedFirstUpdate = false;
     bool g_reportedCombatState = false;
     bool g_reportedNoAmmo = false;
     std::uint64_t g_lastBowStateDiagnostic = 0;
     bool g_hasBowStateDiagnostic = false;
     bool g_lastAttackHeldDiagnostic = false;
-    std::chrono::steady_clock::time_point g_lastStateHeartbeat{};
 
     constexpr float kStep = 1.0f / 20.0f;
     constexpr float kMaxRange = 12000.0f;
@@ -211,18 +205,6 @@ namespace
             std::sin(aim.pitch) * velocityScale
         };
 
-        if (!g_reportedArrowVelocityCorrection) {
-            logger::info(
-                "SmoothCam arrow velocity correction applied: pitch={:.4f}, yaw={:.4f}, speed={:.2f}, power={:.3f}, velocity=({:.2f}, {:.2f}, {:.2f}).",
-                aim.pitch,
-                aim.yaw,
-                speed,
-                getDrawPower(arrow),
-                projectileData.linearVelocity.x,
-                projectileData.linearVelocity.y,
-                projectileData.linearVelocity.z);
-            g_reportedArrowVelocityCorrection = true;
-        }
     }
 
     void ArrowFlightPathUpdateHook(RE::Projectile* projectile)
@@ -238,29 +220,15 @@ namespace
         return { point.x, point.y, point.z };
     }
 
-    struct RaycastDiagnostics
-    {
-        std::size_t rayTests = 0;
-        std::size_t rawHits = 0;
-        std::size_t filterAccepted = 0;
-        std::size_t resolvedObjects = 0;
-        std::size_t ignoredPlayerObjects = 0;
-        std::size_t failedPicks = 0;
-    };
-
     class FirstHitCollector final : public RE::hkpClosestRayHitCollector
     {
     public:
-        explicit FirstHitCollector(const RE::NiAVObject* ignoredObject, RaycastDiagnostics* diagnostics) :
-            ignoredObject(ignoredObject),
-            diagnostics(diagnostics)
+        explicit FirstHitCollector(const RE::NiAVObject* ignoredObject) :
+            ignoredObject(ignoredObject)
         {}
 
         void AddRayHit(const RE::hkpCdBody& body, const RE::hkpShapeRayCastCollectorOutput& hitInfo) override
         {
-            if (diagnostics) {
-                ++diagnostics->rawHits;
-            }
             if (hitInfo.hitFraction >= earlyOutHitFraction) {
                 return;
             }
@@ -285,23 +253,13 @@ namespace
             if (filter >= 64 || (kSmoothCamCollisionMask & (1ULL << filter)) == 0) {
                 return;
             }
-            if (diagnostics) {
-                ++diagnostics->filterAccepted;
-            }
-
             using GetAVObject = RE::NiAVObject* (*)(const RE::hkpCdBody*);
             static REL::Relocation<GetAVObject> getAVObject{ REL::VariantID(76160, 77988, 0) };
             const auto avObject = getAVObject(bodyRoot);
             // SmoothCam ignores the player's scene root and treats unresolved
             // Havok bodies as non-hits, matching its crosshair ray behavior.
             if (!avObject || avObject == ignoredObject) {
-                if (diagnostics && avObject == ignoredObject) {
-                    ++diagnostics->ignoredPlayerObjects;
-                }
                 return;
-            }
-            if (diagnostics) {
-                ++diagnostics->resolvedObjects;
             }
 
             earlyOutHitFraction = hitInfo.hitFraction;
@@ -310,7 +268,6 @@ namespace
 
         std::vector<std::pair<float, RE::NiAVObject*>> hits;
         const RE::NiAVObject* ignoredObject;
-        RaycastDiagnostics* diagnostics;
     };
 
     float Dot(const PhysicsVector& lhs, const PhysicsVector& rhs)
@@ -332,8 +289,7 @@ namespace
     std::optional<PhysicsVector> CastRay(
         RE::PlayerCharacter* player,
         const PhysicsVector& start,
-        const PhysicsVector& end,
-        RaycastDiagnostics* diagnostics = nullptr)
+        const PhysicsVector& end)
     {
         const auto cell = player->GetParentCell();
         const auto world = cell ? cell->GetbhkWorld() : nullptr;
@@ -350,16 +306,10 @@ namespace
         pickData.ray = RE::hkVector4(delta.x * scale, delta.y * scale, delta.z * scale, 1.0f);
 
         const auto player3D = player->Get3D();
-        FirstHitCollector collector(player3D, diagnostics);
+        FirstHitCollector collector(player3D);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
-        if (diagnostics) {
-            ++diagnostics->rayTests;
-        }
         world->PickObject(pickData);
-        if (diagnostics && pickData.pickFailed) {
-            ++diagnostics->failedPicks;
-        }
 
         if (collector.hits.empty()) {
             return std::nullopt;
@@ -428,17 +378,13 @@ namespace
             (static_cast<std::uint64_t>(attackState) << 40) |
             (static_cast<std::uint64_t>(rightType) << 48) |
             (static_cast<std::uint64_t>(leftType) << 56);
-        const auto now = std::chrono::steady_clock::now();
         const bool stateChanged =
             !g_hasBowStateDiagnostic ||
             diagnosticState != g_lastBowStateDiagnostic ||
             g_attackInputHeld != g_lastAttackHeldDiagnostic;
-        const bool heartbeatElapsed =
-            g_lastStateHeartbeat.time_since_epoch().count() == 0 ||
-            now - g_lastStateHeartbeat >= std::chrono::seconds(5);
-        if (stateChanged || heartbeatElapsed) {
+        if (stateChanged) {
             logger::info(
-                "Ranged weapon state: rightType={}, leftType={}, actionBits=0x{:08X}, attack={}, weapon={}, drawn={}, bowBit={}, crossbowBit={}, mappedAttackHeld={}, aiming={}, reason={}.",
+                "Ranged weapon state: rightType={}, leftType={}, actionBits=0x{:08X}, attack={}, weapon={}, drawn={}, bowBit={}, crossbowBit={}, mappedAttackHeld={}, aiming={}.",
                 rightWeapon ? static_cast<int>(rightType) : -1,
                 leftWeapon ? static_cast<int>(leftType) : -1,
                 movementBits,
@@ -448,12 +394,10 @@ namespace
                 bowDrawn,
                 crossbowReady,
                 g_attackInputHeld,
-                aiming,
-                stateChanged ? "changed" : "5s heartbeat");
+                aiming);
             g_lastBowStateDiagnostic = diagnosticState;
             g_lastAttackHeldDiagnostic = g_attackInputHeld;
             g_hasBowStateDiagnostic = true;
-            g_lastStateHeartbeat = now;
         }
 
         return aiming;
@@ -609,18 +553,6 @@ namespace
             pitchCos * std::cos(aim.yaw),
             std::sin(projectilePitch)
         };
-        if (!g_reportedAimParameters) {
-            logger::info(
-                "SmoothCam-state bow aim: aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
-                aim.pitch,
-                aim.yaw,
-                projectilePitch,
-                direction.x,
-                direction.y,
-                direction.z);
-            g_reportedAimParameters = true;
-        }
-
         const auto drawStrength = GetBowDrawStrength(player);
         float weaponSpeed = 1.0f;
         if (const auto weapon = skyrim_cast<const RE::TESObjectWEAP*>(player->GetEquippedObject(false))) {
@@ -646,7 +578,6 @@ namespace
         const auto gravity = worldGravity * (projectile->data.gravity * kGravityScale);
         auto position = ToVector(start);
         auto previous = position;
-        RaycastDiagnostics raycastDiagnostics;
         path.clear();
         path.reserve(kMaxSegments + 1);
         path.push_back(start);
@@ -657,7 +588,7 @@ namespace
             velocity += (gravity - velocity * kLinearDamping) * kStep;
             position += velocity * kStep;
 
-            if (const auto hit = CastRay(player, previous, position, &raycastDiagnostics)) {
+            if (const auto hit = CastRay(player, previous, position)) {
                 impact = *hit;
                 path.push_back(ToNi(*hit));
                 return true;
@@ -671,16 +602,6 @@ namespace
         }
 
         failureReason = "predicted path did not hit a collision surface";
-        if (path.size() > 1 && !g_reportedPredictionMiss) {
-            logger::debug(
-                "Arrow prediction raycast diagnostics: tests={}, rawHits={}, filterAccepted={}, resolvedObjects={}, ignoredPlayerObjects={}, failedPicks={}",
-                raycastDiagnostics.rayTests,
-                raycastDiagnostics.rawHits,
-                raycastDiagnostics.filterAccepted,
-                raycastDiagnostics.resolvedObjects,
-                raycastDiagnostics.ignoredPlayerObjects,
-                raycastDiagnostics.failedPicks);
-        }
         return false;
     }
 
@@ -756,10 +677,6 @@ namespace
     void DrawTrajectory(RE::NiCamera* camera, const std::vector<RE::NiPoint3>& path)
     {
         TrajectoryRenderer::Submit(path, camera);
-        if (!g_reportedFirstPath && path.size() > 1) {
-            logger::info("Trajectory world path passed to the Direct3D renderer: {} points.", path.size());
-            g_reportedFirstPath = true;
-        }
     }
 
     void ResetHUD(RE::IMenu* menu)
@@ -956,13 +873,6 @@ void Trajectory::Update(RE::PlayerCamera* camera)
             DrawTrajectory(worldCamera, path);
         } else {
             TrajectoryRenderer::Clear();
-        }
-        if (!g_reportedFirstPrediction) {
-            logger::info(
-                "First bow prediction completed: hit={}, worldPathPoints={}.",
-                hit,
-                path.size());
-            g_reportedFirstPrediction = true;
         }
         if (!hit && failureReason && path.empty() && !g_reportedPredictionFailure) {
             logger::warn("Bow trajectory was not simulated: {}.", failureReason);

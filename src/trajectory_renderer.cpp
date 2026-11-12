@@ -49,10 +49,10 @@ namespace
     PresentFunction g_originalPresent = nullptr;
     bool g_pipelineReady = false;
     bool g_pipelineFailureReported = false;
-    bool g_projectionReported = false;
+    bool g_projectionFailureReported = false;
     bool g_installFailureReported = false;
     bool g_presentReported = false;
-    bool g_drawReported = false;
+    bool g_missingRenderTargetReported = false;
 
     template <class T>
     void Release(T*& object)
@@ -339,9 +339,9 @@ namespace
         REX::W32::ID3D11DepthStencilView* depthTarget = nullptr;
         g_context->OMGetRenderTargets(1, &renderTarget, &depthTarget);
         if (!renderTarget) {
-            if (!g_drawReported) {
+            if (!g_missingRenderTargetReported) {
                 logger::warn("Trajectory Direct3D draw skipped: Present has no bound render target.");
-                g_drawReported = true;
+                g_missingRenderTargetReported = true;
             }
             Release(depthTarget);
             return;
@@ -405,14 +405,6 @@ namespace
         g_context->HSSetShader(nullptr, nullptr, 0);
         g_context->DSSetShader(nullptr, nullptr, 0);
         g_context->Draw(static_cast<std::uint32_t>(g_vertices.size()), 0);
-        if (!g_drawReported) {
-            logger::info(
-                "Trajectory Direct3D draw submitted: {} vertices from {} screen points.",
-                g_vertices.size(),
-                path.size());
-            g_drawReported = true;
-        }
-
         g_context->IASetInputLayout(oldInputLayout);
         REX::W32::ID3D11Buffer* oldVertexBuffers[] = { oldVertexBuffer };
         g_context->IASetVertexBuffers(0, 1, oldVertexBuffers, &oldStride, &oldOffset);
@@ -562,63 +554,15 @@ void TrajectoryRenderer::Submit(const std::vector<RE::NiPoint3>& path, RE::NiCam
             return std::isfinite(point.x) && std::isfinite(point.y);
         }));
     if (visiblePoints < 2) {
-        if (!g_projectionReported) {
+        if (!g_projectionFailureReported) {
             logger::warn(
                 "Trajectory native projection produced only {} projectable points from {} world points.",
                 visiblePoints,
                 path.size());
-            g_projectionReported = true;
+            g_projectionFailureReported = true;
         }
         Clear();
         return;
-    }
-    if (!g_projectionReported) {
-        auto minX = (std::numeric_limits<float>::max)();
-        auto maxX = (std::numeric_limits<float>::lowest)();
-        auto minY = (std::numeric_limits<float>::max)();
-        auto maxY = (std::numeric_limits<float>::lowest)();
-        auto minDepth = (std::numeric_limits<float>::max)();
-        auto maxDepth = (std::numeric_limits<float>::lowest)();
-        ScreenPoint first{};
-        ScreenPoint last{};
-        bool haveFirst = false;
-        for (const auto& point : projected) {
-            if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
-                continue;
-            }
-            if (point.x < minX) minX = point.x;
-            if (point.x > maxX) maxX = point.x;
-            if (point.y < minY) minY = point.y;
-            if (point.y > maxY) maxY = point.y;
-            if (point.depth < minDepth) minDepth = point.depth;
-            if (point.depth > maxDepth) maxDepth = point.depth;
-            if (!haveFirst) {
-                first = point;
-                haveFirst = true;
-            }
-            last = point;
-        }
-        logger::info(
-            "Trajectory native path queued: {} of {} projected; HUD rect [{:.1f}, {:.1f}, {:.1f}, {:.1f}], screen bounds X[{:.1f}, {:.1f}] Y[{:.1f}, {:.1f}], depth [{:.5f}, {:.5f}], endpoints ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}), render {}x{}.",
-            visiblePoints,
-            path.size(),
-            hudRect.left,
-            hudRect.top,
-            hudRect.right,
-            hudRect.bottom,
-            minX,
-            maxX,
-            minY,
-            maxY,
-            minDepth,
-            maxDepth,
-            first.x,
-            first.y,
-            last.x,
-            last.y,
-            renderWindow->windowWidth,
-            renderWindow->windowHeight);
-        g_projectionReported = true;
     }
     {
         std::scoped_lock lock(g_pathMutex);
