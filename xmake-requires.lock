@@ -27,6 +27,14 @@
             },
             version = "24.2.0"
         },
+        ["minhook v1.3.3#31fecfc4"] = {
+            repo = {
+                branch = "master",
+                commit = "ef2a1792c20dd04846a83267ae5ce7889797ff5e",
+                url = "https://gitlab.com/tboox/xmake-repo.git"
+            },
+            version = "v1.3.3"
+        },
         ["ninja#31fecfc4"] = {
             repo = {
                 branch = "master",

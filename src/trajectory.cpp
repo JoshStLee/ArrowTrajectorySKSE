@@ -10,6 +10,13 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C"
+{
+    int WINAPI MH_Initialize();
+    int WINAPI MH_CreateHook(void* target, void* detour, void** original);
+    int WINAPI MH_EnableHook(void* target);
+}
+
 namespace
 {
     struct PhysicsVector
@@ -30,15 +37,19 @@ namespace
         }
     };
 
-    struct CameraRotation
+    struct AimRotation
     {
         float pitch;
         float yaw;
     };
 
     using CameraStateUpdate = void (*)(RE::TESCameraState*, RE::BSTSmartPointer<RE::TESCameraState>&);
+    using ArrowFlightPathUpdate = void (*)(RE::Projectile*);
+    using ProjectileFloatFunction = float (*)(RE::Projectile*);
 
     std::unordered_map<std::uintptr_t, CameraStateUpdate> g_originalCameraStateUpdates;
+    ArrowFlightPathUpdate g_originalArrowFlightPathUpdate = nullptr;
+    bool g_arrowFlightPathHookInstalled = false;
     bool g_attackInputHeld = false;
     bool g_attackInputListenerRegistered = false;
     RE::GFxMovieView* g_hudMovie = nullptr;
@@ -49,7 +60,9 @@ namespace
     bool g_reportedFirstPrediction = false;
     bool g_reportedPredictionFailure = false;
     bool g_reportedPredictionMiss = false;
+    bool g_reportedPredictionHit = false;
     bool g_reportedAimParameters = false;
+    bool g_reportedArrowVelocityCorrection = false;
     bool g_reportedFirstUpdate = false;
     bool g_reportedCombatState = false;
     bool g_reportedNoAmmo = false;
@@ -125,30 +138,99 @@ namespace
         return { point.x, point.y, point.z };
     }
 
-    CameraRotation GetSmoothCamCameraRotation(const RE::NiMatrix3& matrix)
+    AimRotation GetSmoothCamAimRotation(const RE::NiQuaternion& rotation)
     {
-        constexpr float halfPi = 1.57079632679489661923f;
-        const auto a = std::clamp(-matrix.entry[2][0], -1.0f, 1.0f);
-        const auto pitch = std::clamp(std::asin(a), -halfPi, halfPi) - halfPi;
-        const auto yaw = matrix.entry[0][0] <= 0.001f || matrix.entry[2][2] <= 0.001f
-            ? std::atan2(matrix.entry[0][2], matrix.entry[1][2]) - halfPi
-            : std::atan2(matrix.entry[0][0], matrix.entry[1][0]);
-        return { pitch, yaw };
-    }
-
-    CameraRotation GetSmoothCamCameraRotation(const RE::NiQuaternion& quaternion)
-    {
-        constexpr float halfPi = 1.57079632679489661923f;
         return {
             -std::atan2(
-                2.0f * (quaternion.y * quaternion.z + quaternion.w * quaternion.x),
-                quaternion.w * quaternion.w - quaternion.x * quaternion.x -
-                    quaternion.y * quaternion.y + quaternion.z * quaternion.z) - halfPi,
+                2.0f * (rotation.y * rotation.z + rotation.w * rotation.x),
+                rotation.w * rotation.w - rotation.x * rotation.x -
+                    rotation.y * rotation.y + rotation.z * rotation.z),
             -std::atan2(
-                2.0f * (quaternion.x * quaternion.y + quaternion.w * quaternion.z),
-                quaternion.w * quaternion.w + quaternion.x * quaternion.x -
-                    quaternion.y * quaternion.y - quaternion.z * quaternion.z)
+                2.0f * (rotation.x * rotation.y + rotation.w * rotation.z),
+                rotation.w * rotation.w + rotation.x * rotation.x -
+                    rotation.y * rotation.y - rotation.z * rotation.z)
         };
+    }
+
+    void CorrectPlayerArrowVelocity(RE::ArrowProjectile* arrow)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        if (!arrow || !player) {
+            return;
+        }
+        auto& projectileData = arrow->GetProjectileRuntimeData();
+        if (!projectileData.shooter || projectileData.shooter.get().get() != player ||
+            !projectileData.weaponSource || !projectileData.ammoSource) {
+            return;
+        }
+
+        const auto playerCamera = RE::PlayerCamera::GetSingleton();
+        const auto thirdPersonState = playerCamera
+            ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
+            : nullptr;
+        if (!thirdPersonState) {
+            return;
+        }
+
+        auto aim = GetSmoothCamAimRotation(thirdPersonState->rotation);
+        if (thirdPersonState->freeRotationEnabled) {
+            aim.yaw = player->GetAngleZ();
+        }
+
+        if ((projectileData.flags.underlying() & (1u << 31)) != 0) {
+            aim.pitch = arrow->GetAngleX();
+            aim.yaw = arrow->GetAngleZ();
+        } else {
+            float tilt = 2.5f;
+            if (const auto* setting = RE::INISettingCollection::GetSingleton()->GetSetting("f3PArrowTiltUpAngle:Combat")) {
+                tilt = setting->GetFloat();
+            }
+            aim.pitch -= tilt * 0.017453292519943295f;
+        }
+        aim.pitch *= -1.0f;
+
+        static REL::Relocation<ProjectileFloatFunction> getWeaponSpeedMultiplier{
+            REL::VariantID(42537, 43700, 0)
+        };
+        static REL::Relocation<ProjectileFloatFunction> getDrawPower{
+            REL::VariantID(42536, 43699, 0)
+        };
+        const auto speed = projectileData.ammoSource->data.projectile
+            ? projectileData.ammoSource->data.projectile->data.speed
+            : 0.0f;
+        if (speed <= 0.0f) {
+            return;
+        }
+
+        const auto velocityScale =
+            getWeaponSpeedMultiplier(arrow) * getDrawPower(arrow) * speed * projectileData.speedMult;
+        const auto pitchCos = std::cos(aim.pitch);
+        projectileData.linearVelocity = {
+            pitchCos * std::sin(aim.yaw) * velocityScale,
+            pitchCos * std::cos(aim.yaw) * velocityScale,
+            std::sin(aim.pitch) * velocityScale
+        };
+
+        if (!g_reportedArrowVelocityCorrection) {
+            logger::info(
+                "SmoothCam arrow velocity correction applied: pitch={:.4f}, yaw={:.4f}, speed={:.2f}, power={:.3f}, velocity=({:.2f}, {:.2f}, {:.2f}).",
+                aim.pitch,
+                aim.yaw,
+                speed,
+                getDrawPower(arrow),
+                projectileData.linearVelocity.x,
+                projectileData.linearVelocity.y,
+                projectileData.linearVelocity.z);
+            g_reportedArrowVelocityCorrection = true;
+        }
+    }
+
+    void ArrowFlightPathUpdateHook(RE::Projectile* projectile)
+    {
+        if (g_originalArrowFlightPathUpdate) {
+            g_originalArrowFlightPathUpdate(projectile);
+        }
+        CorrectPlayerArrowVelocity(skyrim_cast<RE::ArrowProjectile*>(projectile));
     }
 
     RE::NiPoint3 ToNi(const PhysicsVector& point)
@@ -156,16 +238,30 @@ namespace
         return { point.x, point.y, point.z };
     }
 
+    struct RaycastDiagnostics
+    {
+        std::size_t rayTests = 0;
+        std::size_t rawHits = 0;
+        std::size_t filterAccepted = 0;
+        std::size_t resolvedObjects = 0;
+        std::size_t ignoredPlayerObjects = 0;
+        std::size_t failedPicks = 0;
+    };
+
     class FirstHitCollector final : public RE::hkpClosestRayHitCollector
     {
     public:
-        explicit FirstHitCollector(const RE::NiAVObject* ignoredObject) :
-            ignoredObject(ignoredObject)
+        explicit FirstHitCollector(const RE::NiAVObject* ignoredObject, RaycastDiagnostics* diagnostics) :
+            ignoredObject(ignoredObject),
+            diagnostics(diagnostics)
         {}
 
         void AddRayHit(const RE::hkpCdBody& body, const RE::hkpShapeRayCastCollectorOutput& hitInfo) override
         {
-            if (hitInfo.hitFraction >= rayHit.hitFraction) {
+            if (diagnostics) {
+                ++diagnostics->rawHits;
+            }
+            if (hitInfo.hitFraction >= earlyOutHitFraction) {
                 return;
             }
 
@@ -178,25 +274,43 @@ namespace
             }();
 
             const auto collidable = static_cast<const RE::hkpCollidable*>(bodyRoot);
-            const auto filter = collidable->broadPhaseHandle.collisionFilterInfo.filter;
-            if (filter >= 64 || ((1ULL << filter) & 0x40122716ULL) == 0) {
+            // The CFilter member stores the packed layer, biped-part, and
+            // system-group bits. SmoothCam's mask selects collision-layer
+            // indices, so extract the layer before indexing the mask.
+            const auto filter = std::to_underlying(
+                collidable->broadPhaseHandle.collisionFilterInfo.GetCollisionLayer());
+            // Match SmoothCam's RayCollector: only collision layers selected
+            // by its Havok filter mask participate in aim and trajectory hits.
+            constexpr std::uint64_t kSmoothCamCollisionMask = 0x40122716;
+            if (filter >= 64 || (kSmoothCamCollisionMask & (1ULL << filter)) == 0) {
                 return;
+            }
+            if (diagnostics) {
+                ++diagnostics->filterAccepted;
             }
 
             using GetAVObject = RE::NiAVObject* (*)(const RE::hkpCdBody*);
             static REL::Relocation<GetAVObject> getAVObject{ REL::VariantID(76160, 77988, 0) };
             const auto avObject = getAVObject(bodyRoot);
+            // SmoothCam ignores the player's scene root and treats unresolved
+            // Havok bodies as non-hits, matching its crosshair ray behavior.
             if (!avObject || avObject == ignoredObject) {
+                if (diagnostics && avObject == ignoredObject) {
+                    ++diagnostics->ignoredPlayerObjects;
+                }
                 return;
+            }
+            if (diagnostics) {
+                ++diagnostics->resolvedObjects;
             }
 
             earlyOutHitFraction = hitInfo.hitFraction;
-            rayHit.hitFraction = hitInfo.hitFraction;
-            rayHit.normal = hitInfo.normal;
-            rayHit.rootCollidable = collidable;
+            hits.emplace_back(hitInfo.hitFraction, avObject);
         }
 
+        std::vector<std::pair<float, RE::NiAVObject*>> hits;
         const RE::NiAVObject* ignoredObject;
+        RaycastDiagnostics* diagnostics;
     };
 
     float Dot(const PhysicsVector& lhs, const PhysicsVector& rhs)
@@ -218,7 +332,8 @@ namespace
     std::optional<PhysicsVector> CastRay(
         RE::PlayerCharacter* player,
         const PhysicsVector& start,
-        const PhysicsVector& end)
+        const PhysicsVector& end,
+        RaycastDiagnostics* diagnostics = nullptr)
     {
         const auto cell = player->GetParentCell();
         const auto world = cell ? cell->GetbhkWorld() : nullptr;
@@ -227,22 +342,32 @@ namespace
         }
 
         const auto delta = end - start;
-        const auto scale = RE::bhkWorld::GetWorldScaleInverse();
+        // SmoothCam's hkpCastRay uses this Havok world-to-physics scale.
+        constexpr float scale = 0.0142875f;
         RE::bhkPickData pickData{};
         pickData.rayInput.from = RE::hkVector4(start.x * scale, start.y * scale, start.z * scale, 1.0f);
         pickData.rayInput.to = RE::hkVector4(0.0f, 0.0f, 0.0f, 0.0f);
         pickData.ray = RE::hkVector4(delta.x * scale, delta.y * scale, delta.z * scale, 1.0f);
 
         const auto player3D = player->Get3D();
-        FirstHitCollector collector(player3D);
+        FirstHitCollector collector(player3D, diagnostics);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
+        if (diagnostics) {
+            ++diagnostics->rayTests;
+        }
         world->PickObject(pickData);
+        if (diagnostics && pickData.pickFailed) {
+            ++diagnostics->failedPicks;
+        }
 
-        if (!collector.HasHit()) {
+        if (collector.hits.empty()) {
             return std::nullopt;
         }
-        return start + delta * collector.rayHit.hitFraction;
+        const auto closest = std::min_element(
+            collector.hits.begin(), collector.hits.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+        return start + delta * closest->first;
     }
 
     bool IsCombatSpell(const RE::MagicItem* spell)
@@ -378,10 +503,13 @@ namespace
             return nullptr;
         }
 
-        const RE::BSFixedString weaponName("WEAPON");
-        const RE::BSFixedString arrowName("Arrow:0");
-        const RE::BSFixedString rightMagazineName("NPC R MagicNode [RMag]");
-        const RE::BSFixedString leftMagazineName("NPC L MagicNode [LMag]");
+        // Match Crosshair::Manager::FindArrowNode in SmoothCam. In particular,
+        // a drawn bow's arrow origin is the WEAPON hand node, while crossbows
+        // and fallback rigs use their magazine nodes.
+        static const RE::BSFixedString weaponName("WEAPON");
+        static const RE::BSFixedString arrowName("Arrow:0");
+        static const RE::BSFixedString rightMagazineName("NPC R MagicNode [RMag]");
+        static const RE::BSFixedString leftMagazineName("NPC L MagicNode [LMag]");
 
         const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
         const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
@@ -397,18 +525,21 @@ namespace
             }
         }
 
-        if (auto* weapon = root->GetObjectByName(weaponName)) {
-            if (weapon->GetObjectByName(arrowName)) {
-                return weapon;
-            }
+        auto* handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(weaponName));
+        if (handNode && handNode->children.size() > 0 && handNode->GetObjectByName(arrowName)) {
+            return handNode;
         }
-        if (auto* magazine = root->GetObjectByName(rightMagazineName)) {
-            if (auto* arrow = magazine->GetObjectByName(arrowName)) {
+
+        handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(rightMagazineName));
+        if (handNode && handNode->children.size() > 0) {
+            if (auto* arrow = handNode->GetObjectByName(arrowName)) {
                 return arrow;
             }
         }
-        if (auto* magazine = root->GetObjectByName(leftMagazineName)) {
-            if (auto* arrow = magazine->GetObjectByName(arrowName)) {
+
+        handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(leftMagazineName));
+        if (handNode && handNode->children.size() > 0) {
+            if (auto* arrow = handNode->GetObjectByName(arrowName)) {
                 return arrow;
             }
         }
@@ -418,7 +549,6 @@ namespace
     bool SimulateArrow(
         RE::PlayerCharacter* player,
         RE::PlayerCamera* playerCamera,
-        RE::NiCamera* camera,
         std::vector<RE::NiPoint3>& path,
         PhysicsVector& impact,
         const char*& failureReason)
@@ -434,39 +564,18 @@ namespace
         const auto thirdPersonState = playerCamera
             ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
             : nullptr;
-        const auto cameraRotation = GetSmoothCamCameraRotation(camera->world.rotate);
-        auto aimRotation = cameraRotation;
-        aimRotation.pitch = -cameraRotation.pitch - 1.57079632679489661923f;
-        if (thirdPersonState && thirdPersonState->freeRotationEnabled) {
-            aimRotation.yaw = player->GetAngleZ();
+        if (!thirdPersonState) {
+            failureReason = "third-person camera state is unavailable";
+            return false;
         }
-
+        auto aim = GetSmoothCamAimRotation(thirdPersonState->rotation);
+        if (thirdPersonState->freeRotationEnabled) {
+            aim.yaw = player->GetAngleZ();
+        }
         float tiltRadians = 0.0f;
         if (const auto* setting = RE::INISettingCollection::GetSingleton()->GetSetting("f3PArrowTiltUpAngle:Combat")) {
             tiltRadians = setting->GetFloat() * 0.017453292519943295f;
         }
-        auto projectilePitch = aimRotation.pitch - tiltRadians;
-        projectilePitch *= -1.0f;
-        const auto pitchCos = std::cos(projectilePitch);
-        const auto direction = PhysicsVector{
-            pitchCos * std::sin(aimRotation.yaw),
-            pitchCos * std::cos(aimRotation.yaw),
-            std::sin(projectilePitch)
-        };
-        if (!g_reportedAimParameters) {
-            logger::info(
-                "SmoothCam-matched bow aim: renderPitch={:.4f}, renderYaw={:.4f}, aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
-                cameraRotation.pitch,
-                cameraRotation.yaw,
-                aimRotation.pitch,
-                aimRotation.yaw,
-                projectilePitch,
-                direction.x,
-                direction.y,
-                direction.z);
-            g_reportedAimParameters = true;
-        }
-
         const auto arrowNode = FindArrowNode(player);
         if (!arrowNode) {
             failureReason = "could not find the bow arrow or hand/magazine node in the player's 3D";
@@ -477,16 +586,40 @@ namespace
             failureReason = "player 3D is unavailable";
             return false;
         }
+        // Match SmoothCam's Crosshair::Manager::TranslateFirePostion: rotate
+        // the arrow's actor-local offset by the difference between actor yaw
+        // and camera yaw before using it as the launch origin.
         const auto playerPosition = player3D->world.translate;
         const auto arrowOffset = arrowNode->world.translate - playerPosition;
-        const auto yawDelta = player->GetAngleZ() - cameraRotation.yaw;
-        const auto cosine = std::cos(yawDelta);
-        const auto sine = std::sin(yawDelta);
+        const auto yawDelta = player->GetAngleZ() - aim.yaw;
+        const auto yawCos = std::cos(yawDelta);
+        const auto yawSin = std::sin(yawDelta);
         const RE::NiPoint3 start{
-            playerPosition.x + cosine * arrowOffset.x - sine * arrowOffset.y,
-            playerPosition.y + sine * arrowOffset.x + cosine * arrowOffset.y,
+            playerPosition.x + yawCos * arrowOffset.x - yawSin * arrowOffset.y,
+            playerPosition.y + yawSin * arrowOffset.x + yawCos * arrowOffset.y,
             playerPosition.z + arrowOffset.z
         };
+        // Match SmoothCam's ArrowFixes::mUpdateArrowFlightPath: subtract the
+        // game's bow tilt from its aim Euler pitch, then negate pitch when
+        // converting the launch rotation to a world-space velocity.
+        const auto projectilePitch = -(aim.pitch - tiltRadians);
+        const auto pitchCos = std::cos(projectilePitch);
+        const PhysicsVector direction{
+            pitchCos * std::sin(aim.yaw),
+            pitchCos * std::cos(aim.yaw),
+            std::sin(projectilePitch)
+        };
+        if (!g_reportedAimParameters) {
+            logger::info(
+                "SmoothCam-state bow aim: aimPitch={:.4f}, aimYaw={:.4f}, projectilePitch={:.4f}, direction=({:.4f}, {:.4f}, {:.4f}).",
+                aim.pitch,
+                aim.yaw,
+                projectilePitch,
+                direction.x,
+                direction.y,
+                direction.z);
+            g_reportedAimParameters = true;
+        }
 
         const auto drawStrength = GetBowDrawStrength(player);
         float weaponSpeed = 1.0f;
@@ -513,15 +646,18 @@ namespace
         const auto gravity = worldGravity * (projectile->data.gravity * kGravityScale);
         auto position = ToVector(start);
         auto previous = position;
+        RaycastDiagnostics raycastDiagnostics;
         path.clear();
         path.reserve(kMaxSegments + 1);
         path.push_back(start);
 
-        for (std::size_t i = 0; i < kMaxSegments; ++i) {
+        // SmoothCam stores 128 points including the launch point, so it makes
+        // at most 127 simulation steps.
+        for (std::size_t i = 1; i < kMaxSegments; ++i) {
             velocity += (gravity - velocity * kLinearDamping) * kStep;
             position += velocity * kStep;
 
-            if (const auto hit = CastRay(player, previous, position)) {
+            if (const auto hit = CastRay(player, previous, position, &raycastDiagnostics)) {
                 impact = *hit;
                 path.push_back(ToNi(*hit));
                 return true;
@@ -533,7 +669,18 @@ namespace
                 break;
             }
         }
+
         failureReason = "predicted path did not hit a collision surface";
+        if (path.size() > 1 && !g_reportedPredictionMiss) {
+            logger::debug(
+                "Arrow prediction raycast diagnostics: tests={}, rawHits={}, filterAccepted={}, resolvedObjects={}, ignoredPlayerObjects={}, failedPicks={}",
+                raycastDiagnostics.rayTests,
+                raycastDiagnostics.rawHits,
+                raycastDiagnostics.filterAccepted,
+                raycastDiagnostics.resolvedObjects,
+                raycastDiagnostics.ignoredPlayerObjects,
+                raycastDiagnostics.failedPicks);
+        }
         return false;
     }
 
@@ -666,6 +813,34 @@ bool Trajectory::Install()
 {
     TrajectoryRenderer::Install();
 
+    if (!g_arrowFlightPathHookInstalled) {
+        constexpr int kMhOk = 0;
+        constexpr int kMhAlreadyInitialized = 1;
+        const auto initializeStatus = MH_Initialize();
+        if (initializeStatus != kMhOk && initializeStatus != kMhAlreadyInitialized) {
+            logger::error("Failed to initialize MinHook for SmoothCam-style arrow correction: status={}.", static_cast<int>(initializeStatus));
+        } else {
+            static REL::Relocation<std::uintptr_t> updateArrowFlightPath{
+                REL::RelocationID(42998, 44184)
+            };
+            const auto createStatus = MH_CreateHook(
+                reinterpret_cast<void*>(updateArrowFlightPath.address()),
+                reinterpret_cast<void*>(ArrowFlightPathUpdateHook),
+                reinterpret_cast<void**>(&g_originalArrowFlightPathUpdate));
+            if (createStatus != kMhOk) {
+                logger::error("Failed to create SmoothCam-compatible UpdateArrowFlightPath hook: status={}", static_cast<int>(createStatus));
+            } else {
+                const auto enableStatus = MH_EnableHook(reinterpret_cast<void*>(updateArrowFlightPath.address()));
+                if (enableStatus != kMhOk) {
+                    logger::error("Failed to enable SmoothCam-compatible UpdateArrowFlightPath hook: status={}", static_cast<int>(enableStatus));
+                } else {
+                    g_arrowFlightPathHookInstalled = true;
+                    logger::info("SmoothCam-style player arrow velocity hook installed on UpdateArrowFlightPath.");
+                }
+            }
+        }
+    }
+
     if (!g_attackInputListenerRegistered) {
         const auto inputManager = RE::BSInputDeviceManager::GetSingleton();
         if (!inputManager) {
@@ -762,7 +937,21 @@ void Trajectory::Update(RE::PlayerCamera* camera)
             return;
         }
         const char* failureReason = nullptr;
-        hit = SimulateArrow(player, camera, worldCamera, path, hitPosition, failureReason);
+        hit = SimulateArrow(player, camera, path, hitPosition, failureReason);
+        if (hit && !g_reportedPredictionHit) {
+            logger::info(
+                "Trajectory prediction endpoint found: impact=({:.1f}, {:.1f}, {:.1f}), pathPoints={}",
+                hitPosition.x,
+                hitPosition.y,
+                hitPosition.z,
+                path.size());
+            g_reportedPredictionHit = true;
+        }
+        // SmoothCam suppresses its arrow arc when the predictor misses, but
+        // that policy hides every useful diagnostic when this standalone
+        // port's Havok ray does not report a collision. Keep the simulated
+        // path visible on a miss; SimulateArrow still truncates it at the
+        // first collision when one is reported.
         if (path.size() > 1) {
             DrawTrajectory(worldCamera, path);
         } else {
@@ -779,7 +968,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
             logger::warn("Bow trajectory was not simulated: {}.", failureReason);
             g_reportedPredictionFailure = true;
         } else if (!hit && failureReason && !path.empty() && !g_reportedPredictionMiss) {
-            logger::info("Bow trajectory was simulated but no collision was found; drawing the predicted path.");
+            logger::warn("Bow trajectory was simulated for {} points, but Havok reported no collision; showing the untruncated prediction.", path.size());
             g_reportedPredictionMiss = true;
         }
     } else {

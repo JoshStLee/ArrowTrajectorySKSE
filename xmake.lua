@@ -9,6 +9,8 @@ end)
 
 includes('lib/commonlibsse-ng')
 
+add_requires('minhook v1.3.3')
+
 set_project('ArrowTrajectory')
 set_version('1.0.0')
 set_license('GPL-3.0')
@@ -23,6 +25,7 @@ add_rules('mode.debug', 'mode.releasedbg', 'mode.release')
 target('ArrowTrajectory')
     set_kind('shared')
     add_deps('commonlibsse-ng')
+    add_packages('minhook')
 
     add_rules('commonlibsse-ng.plugin', {
         name        = 'ArrowTrajectory',

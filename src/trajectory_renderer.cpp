@@ -24,6 +24,7 @@ namespace
         float x;
         float y;
         float depth;
+        float alpha;
     };
 
     using PresentFunction = REX::W32::HRESULT (*)(
@@ -103,14 +104,18 @@ namespace
         };
 
         constexpr auto shaderSource = R"(
-            struct VertexInput { float3 position : POSITION; };
-            float4 VSMain(VertexInput input) : SV_Position
+            struct VertexInput { float3 position : POSITION; float alpha : COLOR0; };
+            struct VertexOutput { float4 position : SV_Position; float alpha : COLOR0; };
+            VertexOutput VSMain(VertexInput input)
             {
-                return float4(input.position, 1.0);
+                VertexOutput output;
+                output.position = float4(input.position, 1.0);
+                output.alpha = input.alpha;
+                return output;
             }
-            float4 PSMain() : SV_Target
+            float4 PSMain(VertexOutput input) : SV_Target
             {
-                return float4(1.0, 1.0, 1.0, 1.0);
+                return float4(1.0, 1.0, 1.0, input.alpha);
             }
         )";
         REX::W32::ID3DBlob* vertexCode = nullptr;
@@ -133,18 +138,29 @@ namespace
             pixelCode->GetBufferSize(),
             nullptr,
             &g_pixelShader) >= 0;
-        const REX::W32::D3D11_INPUT_ELEMENT_DESC inputElement{
-            "POSITION",
-            0,
-            REX::W32::DXGI_FORMAT_R32G32B32_FLOAT,
-            0,
-            0,
-            REX::W32::D3D11_INPUT_PER_VERTEX_DATA,
-            0
+        const REX::W32::D3D11_INPUT_ELEMENT_DESC inputElements[] = {
+            {
+                "POSITION",
+                0,
+                REX::W32::DXGI_FORMAT_R32G32B32_FLOAT,
+                0,
+                0,
+                REX::W32::D3D11_INPUT_PER_VERTEX_DATA,
+                0
+            },
+            {
+                "COLOR",
+                0,
+                REX::W32::DXGI_FORMAT_R32_FLOAT,
+                0,
+                12,
+                REX::W32::D3D11_INPUT_PER_VERTEX_DATA,
+                0
+            }
         };
         const auto inputLayoutCreated = g_device->CreateInputLayout(
-            &inputElement,
-            1,
+            inputElements,
+            2,
             vertexCode->GetBufferPointer(),
             vertexCode->GetBufferSize(),
             &g_inputLayout) >= 0;
@@ -236,10 +252,9 @@ namespace
 
         g_vertices.clear();
         g_vertices.reserve((path.size() - 1) * 6);
-        const auto toClip = [width, height](float x, float y, float depth) {
-            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth };
+        const auto toClip = [width, height](float x, float y, float depth, float alpha) {
+            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, alpha };
         };
-        constexpr float halfWidth = 0.5f;
         for (std::size_t i = 1; i < path.size(); ++i) {
             auto a = path[i - 1];
             auto b = path[i];
@@ -280,12 +295,26 @@ namespace
             b.depth = path[i - 1].depth + dz * t1;
             a = { path[i - 1].x + dx * t0, path[i - 1].y + dy * t0, path[i - 1].depth + dz * t0 };
 
+            // SmoothCam fades its arrow tail across the sampled path. Use a
+            // matching distance-based taper for this solid white trajectory.
+            const auto progress = static_cast<float>(i) / static_cast<float>(path.size() - 1);
+            const auto halfWidth = 2.5f + (1.1f - 2.5f) * progress;
+            const auto previousProgress = static_cast<float>(i - 1) / static_cast<float>(path.size() - 1);
+            const auto alphaAt = [](float distance) {
+                // Make the launch direction easy to read, then de-emphasize
+                // the far ballistic arc, where small velocity errors accumulate.
+                const auto fadeIn = std::clamp(distance / 0.08f, 0.0f, 1.0f);
+                const auto fadeOut = 0.92f - 0.78f * distance;
+                return std::clamp(fadeIn * fadeOut, 0.0f, 1.0f);
+            };
+            const auto alphaA = alphaAt(previousProgress + (progress - previousProgress) * t0);
+            const auto alphaB = alphaAt(previousProgress + (progress - previousProgress) * t1);
             const auto normalX = -dy / length * halfWidth;
             const auto normalY = dx / length * halfWidth;
-            const auto a0 = toClip(a.x + normalX, a.y + normalY, a.depth);
-            const auto a1 = toClip(a.x - normalX, a.y - normalY, a.depth);
-            const auto b0 = toClip(b.x + normalX, b.y + normalY, b.depth);
-            const auto b1 = toClip(b.x - normalX, b.y - normalY, b.depth);
+            const auto a0 = toClip(a.x + normalX, a.y + normalY, a.depth, alphaA);
+            const auto a1 = toClip(a.x - normalX, a.y - normalY, a.depth, alphaA);
+            const auto b0 = toClip(b.x + normalX, b.y + normalY, b.depth, alphaB);
+            const auto b1 = toClip(b.x - normalX, b.y - normalY, b.depth, alphaB);
             g_vertices.insert(g_vertices.end(), { a0, a1, b0, b0, a1, b1 });
         }
         if (g_vertices.empty()) {
