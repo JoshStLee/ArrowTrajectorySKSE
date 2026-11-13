@@ -45,10 +45,13 @@ namespace
     using CameraStateUpdate = void (*)(RE::TESCameraState*, RE::BSTSmartPointer<RE::TESCameraState>&);
     using ArrowFlightPathUpdate = void (*)(RE::Projectile*);
     using ProjectileFloatFunction = float (*)(RE::Projectile*);
+    using MenuAdvanceMovie = void (*)(RE::HUDMenu*, float, std::uint32_t);
 
     std::unordered_map<std::uintptr_t, CameraStateUpdate> g_originalCameraStateUpdates;
     ArrowFlightPathUpdate g_originalArrowFlightPathUpdate = nullptr;
+    MenuAdvanceMovie g_originalHUDAdvanceMovie = nullptr;
     bool g_arrowFlightPathHookInstalled = false;
+    bool g_hudAdvanceHookInstalled = false;
     bool g_attackInputHeld = false;
     bool g_attackInputListenerRegistered = false;
     RE::GFxMovieView* g_hudMovie = nullptr;
@@ -705,6 +708,20 @@ namespace
             (rect.top + rect.bottom) * 0.5f);
     }
 
+    // Camera mods place the drawn camera after Skyrim's PlayerCamera::Update
+    // (CinemaCam, for example, applies its offsets only after the original call).
+    // Projecting from the camera-state hook therefore used Skyrim's native camera.
+    // HUDMenu::AdvanceMovie runs after the camera update and before the frame is
+    // drawn, so Main::WorldRootCamera() is the camera the player actually sees.
+    void HUDAdvanceMovieHook(RE::HUDMenu* menu, float interval, std::uint32_t currentTime)
+    {
+        if (g_originalHUDAdvanceMovie) {
+            g_originalHUDAdvanceMovie(menu, interval, currentTime);
+        }
+        TrajectoryRenderer::Install();
+        Trajectory::Update(RE::PlayerCamera::GetSingleton());
+    }
+
     void CameraStateUpdateHook(
         RE::TESCameraState* state,
         RE::BSTSmartPointer<RE::TESCameraState>& nextState)
@@ -722,13 +739,28 @@ namespace
             logger::info("Camera-state update hook is running.");
             g_reportedFirstUpdate = true;
         }
-        Trajectory::Update(RE::PlayerCamera::GetSingleton());
+        // Fallback for the unlikely case where HUDMenu::AdvanceMovie could not be hooked.
+        if (!g_hudAdvanceHookInstalled) {
+            Trajectory::Update(RE::PlayerCamera::GetSingleton());
+        }
     }
 }
 
 bool Trajectory::Install()
 {
     TrajectoryRenderer::Install();
+
+    if (!g_hudAdvanceHookInstalled) {
+        REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_HUDMenu[0] };
+        const auto original = vtable.write_vfunc(5, HUDAdvanceMovieHook);
+        if (!original) {
+            logger::error("Failed to hook HUDMenu::AdvanceMovie; trajectory updates fall back to camera-state updates.");
+        } else {
+            g_originalHUDAdvanceMovie = reinterpret_cast<MenuAdvanceMovie>(original);
+            g_hudAdvanceHookInstalled = true;
+            logger::info("Trajectory updates run after camera placement via HUDMenu::AdvanceMovie.");
+        }
+    }
 
     if (!g_arrowFlightPathHookInstalled) {
         constexpr int kMhOk = 0;
@@ -809,6 +841,18 @@ bool Trajectory::Install()
 void Trajectory::Update(RE::PlayerCamera* camera)
 {
     if (!camera || !RE::PlayerCharacter::GetSingleton()) {
+        return;
+    }
+
+    // HUDMenu::AdvanceMovie still runs with the game paused. Never predict from a
+    // camera that Skyrim did not update this frame; put the crosshair back instead.
+    const auto ui = RE::UI::GetSingleton();
+    if (!ui || ui->GameIsPaused()) {
+        if (auto* pausedMenu = GetHUDMenu(); pausedMenu && EnsureHUDState(pausedMenu)) {
+            ResetHUD(pausedMenu);
+        } else {
+            TrajectoryRenderer::Clear();
+        }
         return;
     }
 
