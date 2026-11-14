@@ -3,6 +3,7 @@
 #include "trajectory_prediction.h"
 #include "trajectory_renderer.h"
 
+#include <cstring>
 #include <unordered_map>
 
 extern "C"
@@ -24,6 +25,76 @@ namespace
     bool g_arrowFlightPathHookInstalled = false;
     bool g_hudAdvanceHookInstalled = false;
     bool g_reportedFirstUpdate = false;
+    bool g_attackInputHeld = false;
+    bool g_attackInputListenerRegistered = false;
+    bool g_bowWeaponDrawn = false;
+    bool g_actionEventListenerRegistered = false;
+
+    class AttackInputSink final : public RE::BSTEventSink<RE::InputEvent*>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(
+            RE::InputEvent* const* event,
+            RE::BSTEventSource<RE::InputEvent*>*) override
+        {
+            if (!event || !*event) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            const auto userEvents = RE::UserEvents::GetSingleton();
+            if (!userEvents) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            for (auto* current = *event; current; current = current->next) {
+                if (current->GetEventType() != RE::INPUT_EVENT_TYPE::kButton) {
+                    continue;
+                }
+                const auto button = current->AsButtonEvent();
+                if (button && std::strcmp(button->QUserEvent().c_str(), userEvents->rightAttack.c_str()) == 0) {
+                    const bool held = button->IsPressed();
+                    if (held != g_attackInputHeld) {
+                        g_attackInputHeld = held;
+                    }
+                }
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    AttackInputSink g_attackInputSink;
+
+    class ActionEventSink final : public RE::BSTEventSink<SKSE::ActionEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(
+            const SKSE::ActionEvent* event,
+            RE::BSTEventSource<SKSE::ActionEvent>*) override
+        {
+            const auto player = RE::PlayerCharacter::GetSingleton();
+            if (!event || !player || event->actor != player) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            const auto actionType = event->type.get();
+            if (actionType == SKSE::ActionEvent::Type::kBeginDraw ||
+                actionType == SKSE::ActionEvent::Type::kEndDraw) {
+                if (!g_bowWeaponDrawn) {
+                    g_bowWeaponDrawn = true;
+                    logger::debug("Player weapon draw event: guide enabled for an equipped bow.");
+                }
+            } else if (actionType == SKSE::ActionEvent::Type::kBeginSheathe ||
+                       actionType == SKSE::ActionEvent::Type::kEndSheathe) {
+                if (g_bowWeaponDrawn) {
+                    g_bowWeaponDrawn = false;
+                    logger::debug("Player weapon sheathe event: bow guide cleared.");
+                }
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    ActionEventSink g_actionEventSink;
 
     void ArrowFlightPathUpdateHook(RE::Projectile* projectile)
     {
@@ -65,6 +136,16 @@ namespace
     }
 }
 
+bool Trajectory::IsBowAttackHeld()
+{
+    return g_attackInputHeld;
+}
+
+bool Trajectory::IsBowWeaponDrawn()
+{
+    return g_bowWeaponDrawn;
+}
+
 bool Trajectory::Install()
 {
     TrajectoryRenderer::Install();
@@ -104,6 +185,30 @@ bool Trajectory::Install()
                     logger::info("SmoothCam-style player arrow velocity hook installed on UpdateArrowFlightPath.");
                 }
             }
+        }
+    }
+
+    if (!g_attackInputListenerRegistered) {
+        const auto inputManager = RE::BSInputDeviceManager::GetSingleton();
+        if (inputManager) {
+            inputManager->AddEventSink(&g_attackInputSink);
+            g_attackInputListenerRegistered = true;
+            logger::info("Registered the mapped right-attack observer for bow draw detection.");
+        } else {
+            logger::warn("Bow draw input observer is unavailable; using the actor's attack-state fallback.");
+        }
+    }
+
+    if (!g_actionEventListenerRegistered) {
+        if (auto* actionEvents = SKSE::GetActionEventSource()) {
+            if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+                g_bowWeaponDrawn = player->IsWeaponDrawn();
+            }
+            actionEvents->AddEventSink(&g_actionEventSink);
+            g_actionEventListenerRegistered = true;
+            logger::info("Registered SKSE ActionEvent draw/sheathe tracking for the bow guide.");
+        } else {
+            logger::warn("SKSE ActionEvent source is unavailable; bow sheath tracking is inactive.");
         }
     }
 

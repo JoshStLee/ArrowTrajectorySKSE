@@ -9,6 +9,9 @@
 
 namespace
 {
+    constexpr float kAimRayFallbackDistance = 3000.0f;
+    constexpr float kAimRaycastDistance = 12000.0f;
+
     bool g_reportedPredictionFailure = false;
     bool g_reportedPredictionMiss = false;
     bool g_reportedPredictionHit = false;
@@ -43,79 +46,161 @@ namespace
             spell->GetCastingType() != RE::MagicSystem::CastingType::kConstantEffect;
     }
 
-    bool HasBowOrCrossbow(const RE::Actor* actor)
+    bool IsBowOrCrossbowReadied(const RE::Actor* actor)
     {
-        if (!actor) {
-            return false;
-        }
         const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
         const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
-        const auto isRanged = [](const RE::TESObjectWEAP* weapon) {
+        const auto isRangedWeapon = [](const RE::TESObjectWEAP* weapon) {
             return weapon &&
                 (weapon->weaponData.animationType == RE::WEAPON_TYPE::kBow ||
                  weapon->weaponData.animationType == RE::WEAPON_TYPE::kCrossbow);
         };
-        return isRanged(rightWeapon) || isRanged(leftWeapon);
+        if (isRangedWeapon(rightWeapon) || isRangedWeapon(leftWeapon)) {
+            return Trajectory::IsBowWeaponDrawn();
+        }
+
+        static const RE::BSFixedString rightHandTypeVariable("iRightHandType");
+        static const RE::BSFixedString leftHandTypeVariable("iLeftHandType");
+        std::int32_t rightHandType = -1;
+        std::int32_t leftHandType = -1;
+        const auto hasRightType = actor->GetGraphVariableInt(rightHandTypeVariable, rightHandType);
+        const auto hasLeftType = actor->GetGraphVariableInt(leftHandTypeVariable, leftHandType);
+        const bool hasBowHandType =
+            (hasRightType && rightHandType == static_cast<std::int32_t>(RE::WEAPON_TYPE::kBow)) ||
+            (hasLeftType && leftHandType == static_cast<std::int32_t>(RE::WEAPON_TYPE::kBow));
+        if (hasBowHandType) {
+            return Trajectory::IsBowWeaponDrawn();
+        }
+
+        // Type 9 is also reported for a selected spell. Only use it as a
+        // crossbow fallback when no combat spell occupies either hand.
+        const auto& selectedSpells = actor->GetActorRuntimeData().selectedSpells;
+        const bool combatSpellSelected =
+            IsCombatSpell(selectedSpells[RE::Actor::SlotTypes::kLeftHand]) ||
+            IsCombatSpell(selectedSpells[RE::Actor::SlotTypes::kRightHand]);
+        const bool crossbowHandType =
+            (hasRightType && rightHandType == static_cast<std::int32_t>(RE::WEAPON_TYPE::kCrossbow)) ||
+            (hasLeftType && leftHandType == static_cast<std::int32_t>(RE::WEAPON_TYPE::kCrossbow));
+        return crossbowHandType && !combatSpellSelected && Trajectory::IsBowWeaponDrawn();
     }
 
-    bool HasCombatMagicEquipped(RE::Actor* actor)
+    bool IsBowStringInUse(const RE::Actor* actor)
+    {
+        if (Trajectory::IsBowAttackHeld()) {
+            return true;
+        }
+        switch (actor->GetAttackState()) {
+        case RE::ATTACK_STATE_ENUM::kBowDraw:
+        case RE::ATTACK_STATE_ENUM::kBowAttached:
+        case RE::ATTACK_STATE_ENUM::kBowDrawn:
+        case RE::ATTACK_STATE_ENUM::kBowReleasing:
+        case RE::ATTACK_STATE_ENUM::kBowReleased:
+        case RE::ATTACK_STATE_ENUM::kBowNextAttack:
+        case RE::ATTACK_STATE_ENUM::kBowFollowThrough:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    struct AimRay
+    {
+        RE::NiPoint3 origin;
+        RE::NiPoint3 direction;
+        float yaw;
+    };
+
+    AimRay GetSharedAimRay(
+        RE::PlayerCharacter* player,
+        RE::PlayerCamera* playerCamera,
+        RE::NiCamera* worldCamera)
+    {
+        auto direction = Normalize(worldCamera->world.rotate.GetVectorY());
+        auto yaw = std::atan2(direction.x, direction.y);
+        if (const auto thirdPersonState = playerCamera
+                ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
+                : nullptr) {
+            auto aim = TrajectoryPrediction::GetAimRotation(thirdPersonState->rotation);
+            if (thirdPersonState->freeRotationEnabled) {
+                aim.yaw = player->GetAngleZ();
+            }
+            const auto pitchCos = std::cos(aim.pitch);
+            direction = Normalize({
+                pitchCos * std::sin(aim.yaw),
+                pitchCos * std::cos(aim.yaw),
+                -std::sin(aim.pitch)
+            });
+            yaw = aim.yaw;
+        }
+
+        auto origin = worldCamera->world.translate;
+        const auto player3D = player->Get3D();
+        static const RE::BSFixedString headMagicNodeName("NPC Head MagicNode [Hmag]");
+        if (player3D) {
+            if (const auto* magicNode = player3D->GetObjectByName(headMagicNodeName)) {
+                const auto playerPosition = player3D->world.translate;
+                const auto magicOffset = magicNode->world.translate - playerPosition;
+                const auto yawDelta = player->GetAngleZ() - yaw;
+                const auto yawCos = std::cos(yawDelta);
+                const auto yawSin = std::sin(yawDelta);
+                origin = {
+                    playerPosition.x + yawCos * magicOffset.x - yawSin * magicOffset.y,
+                    playerPosition.y + yawSin * magicOffset.x + yawCos * magicOffset.y,
+                    playerPosition.z + magicOffset.z
+                };
+            }
+        }
+        return { origin, direction, yaw };
+    }
+
+    bool IsCombatSpellReadied(const RE::Actor* actor, std::size_t slot, const RE::MagicItem* spell)
+    {
+        if (!IsCombatSpell(spell)) {
+            return false;
+        }
+
+        // These animation-graph flags describe whether a hand has its magic
+        // readied. The selected spell can remain assigned after sheathing.
+        static const RE::BSFixedString leftReadyVariable("bMLh_Ready");
+        static const RE::BSFixedString rightReadyVariable("bMRh_Ready");
+        bool readied = false;
+        const auto& readyVariable = slot == RE::Actor::SlotTypes::kLeftHand
+            ? leftReadyVariable
+            : rightReadyVariable;
+        const bool graphReadied = actor->GetGraphVariableBool(readyVariable, readied) && readied;
+
+        return graphReadied;
+    }
+
+    bool HasCombatMagicReadied(RE::Actor* actor)
     {
         const auto& selectedSpells = actor->GetActorRuntimeData().selectedSpells;
         const auto leftSpell = selectedSpells[RE::Actor::SlotTypes::kLeftHand];
         const auto rightSpell = selectedSpells[RE::Actor::SlotTypes::kRightHand];
-        const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
-        const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
-        const auto hasSpellInHand = [](const RE::MagicItem* spell, const RE::TESObjectWEAP* weapon) {
-            return IsCombatSpell(spell) &&
-                (!weapon || weapon->weaponData.animationType == RE::WEAPON_TYPE::kStaff);
-        };
-        return hasSpellInHand(leftSpell, leftWeapon) || hasSpellInHand(rightSpell, rightWeapon);
+        return IsCombatSpellReadied(actor, RE::Actor::SlotTypes::kLeftHand, leftSpell) ||
+            IsCombatSpellReadied(actor, RE::Actor::SlotTypes::kRightHand, rightSpell);
     }
 
-    void DrawTrajectory(
-        RE::NiCamera* camera,
-        const std::vector<RE::NiPoint3>& path,
-        const RE::NiPoint3* cursor = nullptr)
+    void DrawCameraGuide(RE::PlayerCharacter* player, RE::NiCamera* camera, bool includeLine)
     {
-        TrajectoryRenderer::Submit(path, camera, cursor);
-    }
-
-    void DrawCameraRay(RE::PlayerCharacter* player, RE::NiCamera* camera)
-    {
-        const auto direction = Normalize(camera->world.rotate.GetVectorY());
+        const auto aimRay = GetSharedAimRay(player, RE::PlayerCamera::GetSingleton(), camera);
+        const auto& direction = aimRay.direction;
         if (Dot(direction, direction) <= 0.0001f) {
             TrajectoryRenderer::Clear();
             return;
         }
 
-        const auto origin = camera->world.translate;
-        auto endpoint = origin + direction * 3000.0f;
-        if (const auto result = TrajectoryPrediction::CastRay(player, origin, origin + direction * 12000.0f)) {
-            endpoint = *result;
-        }
-
-        const auto cursor = endpoint;
-        const std::vector<RE::NiPoint3> path{ origin, cursor };
-        DrawTrajectory(camera, path, &cursor);
-    }
-
-    void DrawCameraCursor(RE::PlayerCharacter* player, RE::NiCamera* camera)
-    {
-        const auto direction = Normalize(camera->world.rotate.GetVectorY());
-        if (Dot(direction, direction) <= 0.0001f) {
-            TrajectoryRenderer::Clear();
-            return;
-        }
-
-        const auto origin = camera->world.translate;
-        auto cursor = origin + direction * 3000.0f;
-        if (const auto result = TrajectoryPrediction::CastRay(player, origin, origin + direction * 12000.0f)) {
+        const auto origin = aimRay.origin;
+        auto cursor = origin + direction * kAimRayFallbackDistance;
+        if (const auto result = TrajectoryPrediction::CastRay(player, origin, origin + direction * kAimRaycastDistance)) {
             cursor = *result;
         }
 
-        // Submit only a world-projected cursor while the bow is readied but
-        // the string has not been drawn far enough to predict an arrow path.
-        DrawTrajectory(camera, {}, &cursor);
+        std::vector<RE::NiPoint3> path;
+        if (includeLine) {
+            path = { origin, cursor };
+        }
+        TrajectoryRenderer::Submit(path, camera, &cursor);
     }
 
 }
@@ -151,8 +236,8 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         return;
     }
 
-    const bool usingBow = HasBowOrCrossbow(player);
-    const bool usingMagic = !usingBow && HasCombatMagicEquipped(player);
+    const bool usingMagic = HasCombatMagicReadied(player);
+    const bool usingBow = !usingMagic && IsBowOrCrossbowReadied(player);
 
     const auto worldCamera = RE::Main::WorldRootCamera();
     if (!worldCamera) {
@@ -169,13 +254,21 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     RE::NiPoint3 hitPosition{};
     bool hit = false;
     if (usingBow) {
+        // At bow-ready idle there is no meaningful arrow velocity yet. Show
+        // the camera ray and world dot until the bow attack state starts; only
+        // then use the ballistic predictor.
+        if (!IsBowStringInUse(player)) {
+            DrawCameraGuide(player, worldCamera, true);
+            return;
+        }
+
         const auto ammo = player->GetCurrentAmmo();
         if (!ammo || !ammo->data.projectile) {
             if (!g_reportedNoAmmo) {
                 logger::warn("Trajectory prediction skipped: no current bow ammo/projectile.");
                 g_reportedNoAmmo = true;
             }
-            DrawCameraCursor(player, worldCamera);
+            DrawCameraGuide(player, worldCamera, true);
             return;
         }
         const char* failureReason = nullptr;
@@ -199,9 +292,9 @@ void Trajectory::Update(RE::PlayerCamera* camera)
                 hitPosition = path.back();
             }
             const auto cursor = hitPosition;
-            DrawTrajectory(worldCamera, path, &cursor);
+            TrajectoryRenderer::Submit(path, worldCamera, &cursor);
         } else {
-            DrawCameraCursor(player, worldCamera);
+            DrawCameraGuide(player, worldCamera, path.empty());
         }
         if (!hit && failureReason && path.empty() && !g_reportedPredictionFailure) {
             logger::warn("Bow trajectory was not simulated: {}.", failureReason);
@@ -214,26 +307,10 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         // Use the same third-person camera-state aim rotation as the bow
         // predictor and SmoothCam's magic ray. Unlike the bow, spells travel
         // along this direction without applying gravity or simulating an arc.
-        auto direction = worldCamera->world.rotate.GetVectorY();
-        auto normalizedDirection = Normalize(direction);
-        auto cameraYaw = std::atan2(normalizedDirection.x, normalizedDirection.y);
-        if (const auto thirdPersonState = camera
-                ? skyrim_cast<const RE::ThirdPersonState*>(camera->currentState.get())
-                : nullptr) {
-            auto aim = TrajectoryPrediction::GetAimRotation(thirdPersonState->rotation);
-            if (thirdPersonState->freeRotationEnabled) {
-                aim.yaw = player->GetAngleZ();
-            }
-            const auto pitchCos = std::cos(aim.pitch);
-            normalizedDirection = RE::NiPoint3{
-                pitchCos * std::sin(aim.yaw),
-                pitchCos * std::cos(aim.yaw),
-                -std::sin(aim.pitch)
-            };
-            cameraYaw = aim.yaw;
-        }
+        const auto aimRay = GetSharedAimRay(player, camera, worldCamera);
+        auto normalizedDirection = aimRay.direction;
         if (Dot(normalizedDirection, normalizedDirection) <= 0.0001f) {
-            DrawCameraRay(player, worldCamera);
+            DrawCameraGuide(player, worldCamera, true);
             TrajectoryHUD::Center(menu);
             return;
         }
@@ -241,31 +318,14 @@ void Trajectory::Update(RE::PlayerCamera* camera)
 
         // Match SmoothCam's magic launch point and TranslateFirePostion yaw
         // adjustment so this straight path starts where spell aim originates.
-        auto origin = worldCamera->world.translate;
-        const auto player3D = player->Get3D();
-        static const RE::BSFixedString headMagicNodeName("NPC Head MagicNode [Hmag]");
-        if (player3D) {
-            if (const auto* magicNode = player3D->GetObjectByName(headMagicNodeName)) {
-                const auto playerPosition = player3D->world.translate;
-                const auto magicOffset = magicNode->world.translate - playerPosition;
-                const auto yawDelta = player->GetAngleZ() - cameraYaw;
-                const auto yawCos = std::cos(yawDelta);
-                const auto yawSin = std::sin(yawDelta);
-                origin = {
-                    playerPosition.x + yawCos * magicOffset.x - yawSin * magicOffset.y,
-                    playerPosition.y + yawSin * magicOffset.x + yawCos * magicOffset.y,
-                    playerPosition.z + magicOffset.z
-                };
-            }
-        }
+        const auto origin = aimRay.origin;
         // When the collision ray has no hit, keep a visible aim dot along the
         // same camera ray. A real impact always replaces this fallback point.
-        constexpr float kMagicCursorFallbackRange = 3000.0f;
-        hitPosition = origin + normalizedDirection * kMagicCursorFallbackRange;
+        hitPosition = origin + normalizedDirection * kAimRayFallbackDistance;
         if (const auto result = TrajectoryPrediction::CastRay(
                 player,
                 origin,
-                origin + normalizedDirection * 12000.0f)) {
+                origin + normalizedDirection * kAimRaycastDistance)) {
             hitPosition = *result;
             hit = true;
         }
@@ -283,7 +343,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         }
         const auto cursor = hitPosition;
         const std::vector<RE::NiPoint3> spellPath{ origin, cursor };
-        DrawTrajectory(worldCamera, spellPath, &cursor);
+        TrajectoryRenderer::Submit(spellPath, worldCamera, &cursor);
     } else {
         TrajectoryRenderer::Clear();
     }
