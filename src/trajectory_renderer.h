@@ -11,6 +11,9 @@ namespace RE
 namespace TrajectoryRenderer
 {
     bool Install();
-    void Submit(const std::vector<RE::NiPoint3>& path, RE::NiCamera* camera);
+    void Submit(
+        const std::vector<RE::NiPoint3>& path,
+        RE::NiCamera* camera,
+        const RE::NiPoint3* cursor = nullptr);
     void Clear();
 }

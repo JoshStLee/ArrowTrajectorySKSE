@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace
@@ -24,6 +25,9 @@ namespace
         float x;
         float y;
         float depth;
+        float red;
+        float green;
+        float blue;
         float alpha;
     };
 
@@ -34,6 +38,7 @@ namespace
 
     std::mutex g_pathMutex;
     std::vector<ScreenPoint> g_screenPath;
+    std::optional<ScreenPoint> g_screenCursor;
     std::vector<Vertex> g_vertices;
     RE::BSGraphics::Renderer* g_renderer = nullptr;
     REX::W32::ID3D11Device* g_device = nullptr;
@@ -53,6 +58,8 @@ namespace
     bool g_installFailureReported = false;
     bool g_presentReported = false;
     bool g_missingRenderTargetReported = false;
+    bool g_cursorProjectionReported = false;
+    bool g_cursorDrawReported = false;
 
     template <class T>
     void Release(T*& object)
@@ -104,18 +111,18 @@ namespace
         };
 
         constexpr auto shaderSource = R"(
-            struct VertexInput { float3 position : POSITION; float alpha : COLOR0; };
-            struct VertexOutput { float4 position : SV_Position; float alpha : COLOR0; };
+            struct VertexInput { float3 position : POSITION; float4 color : COLOR0; };
+            struct VertexOutput { float4 position : SV_Position; float4 color : COLOR0; };
             VertexOutput VSMain(VertexInput input)
             {
                 VertexOutput output;
                 output.position = float4(input.position, 1.0);
-                output.alpha = input.alpha;
+                output.color = input.color;
                 return output;
             }
             float4 PSMain(VertexOutput input) : SV_Target
             {
-                return float4(1.0, 1.0, 1.0, input.alpha);
+                return input.color;
             }
         )";
         REX::W32::ID3DBlob* vertexCode = nullptr;
@@ -151,7 +158,7 @@ namespace
             {
                 "COLOR",
                 0,
-                REX::W32::DXGI_FORMAT_R32_FLOAT,
+                REX::W32::DXGI_FORMAT_R32G32B32A32_FLOAT,
                 0,
                 12,
                 REX::W32::D3D11_INPUT_PER_VERTEX_DATA,
@@ -172,7 +179,7 @@ namespace
         }
 
         REX::W32::D3D11_BUFFER_DESC bufferDescription{};
-        bufferDescription.byteWidth = static_cast<std::uint32_t>(sizeof(Vertex) * 6 * 128);
+        bufferDescription.byteWidth = static_cast<std::uint32_t>(sizeof(Vertex) * (6 * 128 + 6 * 32));
         bufferDescription.usage = REX::W32::D3D11_USAGE_DYNAMIC;
         bufferDescription.bindFlags = REX::W32::D3D11_BIND_VERTEX_BUFFER;
         bufferDescription.cpuAccessFlags = REX::W32::D3D11_CPU_ACCESS_WRITE;
@@ -228,11 +235,13 @@ namespace
     void DrawSubmittedPath()
     {
         std::vector<ScreenPoint> path;
+        std::optional<ScreenPoint> cursor;
         {
             std::scoped_lock lock(g_pathMutex);
             path = g_screenPath;
+            cursor = g_screenCursor;
         }
-        if (path.size() < 2) {
+        if (path.size() < 2 && !cursor) {
             return;
         }
         if (!g_pipelineReady && !CreatePipeline()) {
@@ -251,9 +260,12 @@ namespace
         const auto height = static_cast<float>(renderWindow->windowHeight);
 
         g_vertices.clear();
-        g_vertices.reserve((path.size() - 1) * 6);
+        g_vertices.reserve((path.size() > 1 ? (path.size() - 1) * 6 : 0) + (cursor ? 6 * 32 : 0));
         const auto toClip = [width, height](float x, float y, float depth, float alpha) {
-            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, alpha };
+            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, 1.0f, 1.0f, 1.0f, alpha };
+        };
+        const auto toClipColor = [width, height](float x, float y, float depth, float red, float green, float blue) {
+            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, red, green, blue, 1.0f };
         };
         for (std::size_t i = 1; i < path.size(); ++i) {
             auto a = path[i - 1];
@@ -316,6 +328,24 @@ namespace
             const auto b0 = toClip(b.x + normalX, b.y + normalY, b.depth, alphaB);
             const auto b1 = toClip(b.x - normalX, b.y - normalY, b.depth, alphaB);
             g_vertices.insert(g_vertices.end(), { a0, a1, b0, b0, a1, b1 });
+        }
+        const auto lineVertexCount = g_vertices.size();
+        if (cursor && std::isfinite(cursor->x) && std::isfinite(cursor->y) &&
+            cursor->x >= 0.0f && cursor->x <= width && cursor->y >= 0.0f && cursor->y <= height)
+        {
+            constexpr std::size_t kCursorSegments = 24;
+            const auto appendDisk = [&](float radius, float red, float green, float blue) {
+                const auto center = toClipColor(cursor->x, cursor->y, cursor->depth, red, green, blue);
+                for (std::size_t i = 0; i < kCursorSegments; ++i) {
+                    const auto a = static_cast<float>(i) * 6.2831853071795864769f / static_cast<float>(kCursorSegments);
+                    const auto b = static_cast<float>(i + 1) * 6.2831853071795864769f / static_cast<float>(kCursorSegments);
+                    const auto outerA = toClipColor(cursor->x + std::cos(a) * radius, cursor->y + std::sin(a) * radius, cursor->depth, red, green, blue);
+                    const auto outerB = toClipColor(cursor->x + std::cos(b) * radius, cursor->y + std::sin(b) * radius, cursor->depth, red, green, blue);
+                    g_vertices.insert(g_vertices.end(), { center, outerA, outerB });
+                }
+            };
+            appendDisk(3.25f, 0.0f, 0.0f, 0.0f);
+            appendDisk(1.75f, 1.0f, 1.0f, 1.0f);
         }
         if (g_vertices.empty()) {
             return;
@@ -404,7 +434,21 @@ namespace
         g_context->GSSetShader(nullptr, nullptr, 0);
         g_context->HSSetShader(nullptr, nullptr, 0);
         g_context->DSSetShader(nullptr, nullptr, 0);
-        g_context->Draw(static_cast<std::uint32_t>(g_vertices.size()), 0);
+        if (lineVertexCount > 0) {
+            g_context->Draw(static_cast<std::uint32_t>(lineVertexCount), 0);
+        }
+        if (cursor && g_vertices.size() > lineVertexCount) {
+            // The cursor is a HUD-scale marker anchored to a world hit. Draw it
+            // after the depth-tested path so fallback aim points remain visible.
+            g_context->OMSetDepthStencilState(g_depthDisabledState, 0);
+            g_context->Draw(
+                static_cast<std::uint32_t>(g_vertices.size() - lineVertexCount),
+                static_cast<std::uint32_t>(lineVertexCount));
+        }
+        if (cursor && !g_cursorDrawReported) {
+            logger::info("World-hit cursor draw submitted at screen ({:.1f}, {:.1f}), depth {:.4f}.", cursor->x, cursor->y, cursor->depth);
+            g_cursorDrawReported = true;
+        }
         g_context->IASetInputLayout(oldInputLayout);
         REX::W32::ID3D11Buffer* oldVertexBuffers[] = { oldVertexBuffer };
         g_context->IASetVertexBuffers(0, 1, oldVertexBuffers, &oldStride, &oldOffset);
@@ -491,10 +535,14 @@ bool TrajectoryRenderer::Install()
     return true;
 }
 
-void TrajectoryRenderer::Submit(const std::vector<RE::NiPoint3>& path, RE::NiCamera* camera)
+void TrajectoryRenderer::Submit(
+    const std::vector<RE::NiPoint3>& path,
+    RE::NiCamera* camera,
+    const RE::NiPoint3* cursor)
 {
     std::vector<ScreenPoint> projected;
-    if (!camera || path.size() < 2) {
+    std::optional<ScreenPoint> projectedCursor;
+    if (!camera || (path.size() < 2 && !cursor)) {
         Clear();
         return;
     }
@@ -522,8 +570,7 @@ void TrajectoryRenderer::Submit(const std::vector<RE::NiPoint3>& path, RE::NiCam
     const auto scaleX = static_cast<float>(renderWindow->windowWidth) / hudWidth;
     const auto scaleY = static_cast<float>(renderWindow->windowHeight) / hudHeight;
 
-    projected.reserve(path.size());
-    for (const auto& point : path) {
+    const auto project = [&](const RE::NiPoint3& point) -> std::optional<ScreenPoint> {
         float screenX = 0.0f;
         float screenY = 0.0f;
         float screenDepth = 0.0f;
@@ -537,23 +584,43 @@ void TrajectoryRenderer::Submit(const std::vector<RE::NiPoint3>& path, RE::NiCam
                 1.0e-5f) ||
             !std::isfinite(screenX) || !std::isfinite(screenY) || !std::isfinite(screenDepth))
         {
-            const auto invalid = std::numeric_limits<float>::quiet_NaN();
-            projected.push_back({ invalid, invalid });
-            continue;
+            return std::nullopt;
         }
-        static_cast<void>(screenDepth);
-        projected.push_back({
+        return ScreenPoint{
             (screenX - hudRect.left) * scaleX,
             (screenY - hudRect.top) * scaleY,
             screenDepth
-        });
+        };
+    };
+
+    projected.reserve(path.size());
+    for (const auto& point : path) {
+        const auto screenPoint = project(point);
+        if (screenPoint) {
+            projected.push_back(*screenPoint);
+        } else {
+            const auto invalid = std::numeric_limits<float>::quiet_NaN();
+            projected.push_back({ invalid, invalid, invalid });
+        }
+    }
+
+    if (cursor) {
+        projectedCursor = project(*cursor);
+        if (projectedCursor && !g_cursorProjectionReported) {
+            logger::info(
+                "World-hit cursor projected to screen ({:.1f}, {:.1f}), depth {:.4f}.",
+                projectedCursor->x,
+                projectedCursor->y,
+                projectedCursor->depth);
+            g_cursorProjectionReported = true;
+        }
     }
 
     const auto visiblePoints = static_cast<std::size_t>(std::count_if(
         projected.begin(), projected.end(), [](const auto& point) {
             return std::isfinite(point.x) && std::isfinite(point.y);
         }));
-    if (visiblePoints < 2) {
+    if (visiblePoints < 2 && !projectedCursor) {
         if (!g_projectionFailureReported) {
             logger::warn(
                 "Trajectory native projection produced only {} projectable points from {} world points.",
@@ -567,6 +634,7 @@ void TrajectoryRenderer::Submit(const std::vector<RE::NiPoint3>& path, RE::NiCam
     {
         std::scoped_lock lock(g_pathMutex);
         g_screenPath = std::move(projected);
+        g_screenCursor = projectedCursor;
     }
 }
 
@@ -574,4 +642,5 @@ void TrajectoryRenderer::Clear()
 {
     std::scoped_lock lock(g_pathMutex);
     g_screenPath.clear();
+    g_screenCursor.reset();
 }
