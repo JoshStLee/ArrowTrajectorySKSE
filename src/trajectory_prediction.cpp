@@ -36,6 +36,12 @@ namespace
     constexpr float kLinearDamping = 0.099609f;
     constexpr float kGravityScale = 59.0f;
     constexpr float kMinBowPower = 0.2f;
+    constexpr std::uint64_t kSmoothCamCollisionMask = 0x40122716;
+    // Arrow paths should stop on corpse ragdolls, which use the DeadBip layer
+    // omitted by SmoothCam's camera and aim-ray mask.
+    constexpr std::uint64_t kArrowPredictionCollisionMask =
+        kSmoothCamCollisionMask |
+        (1ULL << std::to_underlying(RE::COL_LAYER::kDeadBip));
 
     struct BowDrawTimerEntry
     {
@@ -70,6 +76,15 @@ namespace
         auto& projectileData = arrow->GetProjectileRuntimeData();
         if (!projectileData.shooter || projectileData.shooter.get().get() != player ||
             !projectileData.weaponSource || !projectileData.ammoSource) {
+            return;
+        }
+
+        if (player->IsOnMount()) {
+            static bool reportedMountedArrowCorrectionBypass = false;
+            if (!reportedMountedArrowCorrectionBypass) {
+                logger::info("Mounted player arrow keeps Skyrim's native flight velocity.");
+                reportedMountedArrowCorrectionBypass = true;
+            }
             return;
         }
 
@@ -130,8 +145,11 @@ namespace
     class FirstHitCollector final : public RE::hkpClosestRayHitCollector
     {
     public:
-        explicit FirstHitCollector(const RE::NiAVObject* ignoredObject) :
-            ignoredObject(ignoredObject)
+        explicit FirstHitCollector(
+            const RE::NiAVObject* ignoredObject,
+            std::uint64_t collisionMask = kSmoothCamCollisionMask) :
+            ignoredObject(ignoredObject),
+            collisionMask(collisionMask)
         {}
 
         void AddRayHit(const RE::hkpCdBody& body, const RE::hkpShapeRayCastCollectorOutput& hitInfo) override
@@ -156,8 +174,7 @@ namespace
                 collidable->broadPhaseHandle.collisionFilterInfo.GetCollisionLayer());
             // Match SmoothCam's RayCollector: only collision layers selected
             // by its Havok filter mask participate in aim and trajectory hits.
-            constexpr std::uint64_t kSmoothCamCollisionMask = 0x40122716;
-            if (filter >= 64 || (kSmoothCamCollisionMask & (1ULL << filter)) == 0) {
+            if (filter >= 64 || (collisionMask & (1ULL << filter)) == 0) {
                 return;
             }
             using GetAVObject = RE::NiAVObject* (*)(const RE::hkpCdBody*);
@@ -175,6 +192,7 @@ namespace
 
         std::vector<std::pair<float, RE::NiAVObject*>> hits;
         const RE::NiAVObject* ignoredObject;
+        std::uint64_t collisionMask;
     };
 
     float Dot(const PhysicsVector& lhs, const PhysicsVector& rhs)
@@ -196,7 +214,8 @@ namespace
     std::optional<PhysicsVector> CastRayVector(
         RE::PlayerCharacter* player,
         const PhysicsVector& start,
-        const PhysicsVector& end)
+        const PhysicsVector& end,
+        std::uint64_t collisionMask = kSmoothCamCollisionMask)
     {
         const auto cell = player->GetParentCell();
         const auto world = cell ? cell->GetbhkWorld() : nullptr;
@@ -213,7 +232,7 @@ namespace
         pickData.ray = RE::hkVector4(delta.x * scale, delta.y * scale, delta.z * scale, 1.0f);
 
         const auto player3D = player->Get3D();
-        FirstHitCollector collector(player3D);
+        FirstHitCollector collector(player3D, collisionMask);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
         world->PickObject(pickData);
@@ -318,7 +337,7 @@ namespace
             return false;
         }
         auto aim = GetAimRotationInternal(thirdPersonState->rotation);
-        if (thirdPersonState->freeRotationEnabled) {
+        if (thirdPersonState->freeRotationEnabled && !player->IsOnMount()) {
             aim.yaw = player->GetAngleZ();
         }
         float tiltRadians = 0.0f;
@@ -336,24 +355,27 @@ namespace
             return false;
         }
         // Match SmoothCam's Crosshair::Manager::TranslateFirePostion: rotate
-        // the arrow's actor-local offset by the difference between actor yaw
-        // and camera yaw before using it as the launch origin.
+        // the arrow's actor-local offset for ordinary third person aiming.
+        // Horse camera keeps the node's world position unchanged.
         const auto playerPosition = player3D->world.translate;
-        const auto arrowOffset = arrowNode->world.translate - playerPosition;
-        const auto yawDelta = player->GetAngleZ() - aim.yaw;
-        const auto yawCos = std::cos(yawDelta);
-        const auto yawSin = std::sin(yawDelta);
-        const RE::NiPoint3 start{
-            playerPosition.x + yawCos * arrowOffset.x - yawSin * arrowOffset.y,
-            playerPosition.y + yawSin * arrowOffset.x + yawCos * arrowOffset.y,
-            playerPosition.z + arrowOffset.z
-        };
+        RE::NiPoint3 start = arrowNode->world.translate;
+        if (!player->IsOnMount()) {
+            const auto arrowOffset = arrowNode->world.translate - playerPosition;
+            const auto yawDelta = player->GetAngleZ() - aim.yaw;
+            const auto yawCos = std::cos(yawDelta);
+            const auto yawSin = std::sin(yawDelta);
+            start = {
+                playerPosition.x + yawCos * arrowOffset.x - yawSin * arrowOffset.y,
+                playerPosition.y + yawSin * arrowOffset.x + yawCos * arrowOffset.y,
+                playerPosition.z + arrowOffset.z
+            };
+        }
         // Match SmoothCam's ArrowFixes::mUpdateArrowFlightPath: subtract the
         // game's bow tilt from its aim Euler pitch, then negate pitch when
         // converting the launch rotation to a world-space velocity.
         const auto projectilePitch = -(aim.pitch - tiltRadians);
         const auto pitchCos = std::cos(projectilePitch);
-        const PhysicsVector direction{
+        auto direction = PhysicsVector{
             pitchCos * std::sin(aim.yaw),
             pitchCos * std::cos(aim.yaw),
             std::sin(projectilePitch)
@@ -393,7 +415,11 @@ namespace
             velocity += (gravity - velocity * kLinearDamping) * kStep;
             position += velocity * kStep;
 
-            if (const auto hit = CastRayVector(player, previous, position)) {
+            if (const auto hit = CastRayVector(
+                    player,
+                    previous,
+                    position,
+                    kArrowPredictionCollisionMask)) {
                 impact = *hit;
                 path.push_back(ToNi(*hit));
                 return true;

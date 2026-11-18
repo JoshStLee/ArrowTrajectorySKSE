@@ -121,7 +121,7 @@ namespace
                 ? skyrim_cast<const RE::ThirdPersonState*>(playerCamera->currentState.get())
                 : nullptr) {
             auto aim = TrajectoryPrediction::GetAimRotation(thirdPersonState->rotation);
-            if (thirdPersonState->freeRotationEnabled) {
+            if (thirdPersonState->freeRotationEnabled && !player->IsOnMount()) {
                 aim.yaw = player->GetAngleZ();
             }
             const auto pitchCos = std::cos(aim.pitch);
@@ -138,18 +138,25 @@ namespace
         static const RE::BSFixedString headMagicNodeName("NPC Head MagicNode [Hmag]");
         if (player3D) {
             if (const auto* magicNode = player3D->GetObjectByName(headMagicNodeName)) {
-                const auto playerPosition = player3D->world.translate;
-                const auto magicOffset = magicNode->world.translate - playerPosition;
-                const auto yawDelta = player->GetAngleZ() - yaw;
-                const auto yawCos = std::cos(yawDelta);
-                const auto yawSin = std::sin(yawDelta);
-                origin = {
-                    playerPosition.x + yawCos * magicOffset.x - yawSin * magicOffset.y,
-                    playerPosition.y + yawSin * magicOffset.x + yawCos * magicOffset.y,
-                    playerPosition.z + magicOffset.z
-                };
+                if (player->IsOnMount()) {
+                    // Horse camera offsets are already represented by the
+                    // mounted node transform; do not rotate them by actor yaw.
+                    origin = magicNode->world.translate;
+                } else {
+                    const auto playerPosition = player3D->world.translate;
+                    const auto magicOffset = magicNode->world.translate - playerPosition;
+                    const auto yawDelta = player->GetAngleZ() - yaw;
+                    const auto yawCos = std::cos(yawDelta);
+                    const auto yawSin = std::sin(yawDelta);
+                    origin = {
+                        playerPosition.x + yawCos * magicOffset.x - yawSin * magicOffset.y,
+                        playerPosition.y + yawSin * magicOffset.x + yawCos * magicOffset.y,
+                        playerPosition.z + magicOffset.z
+                    };
+                }
             }
         }
+
         return { origin, direction, yaw };
     }
 
