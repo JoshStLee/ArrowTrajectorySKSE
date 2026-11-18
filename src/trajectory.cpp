@@ -181,6 +181,27 @@ namespace
             IsCombatSpellReadied(actor, RE::Actor::SlotTypes::kRightHand, rightSpell);
     }
 
+    bool IsSpellCastActive(RE::Actor* actor, std::size_t slot)
+    {
+        const auto source = slot == RE::Actor::SlotTypes::kLeftHand
+            ? RE::MagicSystem::CastingSource::kLeftHand
+            : RE::MagicSystem::CastingSource::kRightHand;
+        const auto caster = actor->GetMagicCaster(source);
+        if (!caster) {
+            return false;
+        }
+
+        const auto state = caster->state.get();
+        return state == RE::MagicCaster::State::kCharging ||
+            state == RE::MagicCaster::State::kCasting;
+    }
+
+    bool IsSpellCastActive(RE::Actor* actor)
+    {
+        return IsSpellCastActive(actor, RE::Actor::SlotTypes::kLeftHand) ||
+            IsSpellCastActive(actor, RE::Actor::SlotTypes::kRightHand);
+    }
+
     void DrawCameraGuide(RE::PlayerCharacter* player, RE::NiCamera* camera, bool includeLine)
     {
         const auto aimRay = GetSharedAimRay(player, RE::PlayerCamera::GetSingleton(), camera);
@@ -258,7 +279,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         // the camera ray and world dot until the bow attack state starts; only
         // then use the ballistic predictor.
         if (!IsBowStringInUse(player)) {
-            DrawCameraGuide(player, worldCamera, true);
+            DrawCameraGuide(player, worldCamera, false);
             return;
         }
 
@@ -342,8 +363,10 @@ void Trajectory::Update(RE::PlayerCamera* camera)
             g_reportedMagicRayResult = true;
         }
         const auto cursor = hitPosition;
-        const std::vector<RE::NiPoint3> spellPath{ origin, cursor };
-        TrajectoryRenderer::Submit(spellPath, worldCamera, &cursor);
+        if (IsSpellCastActive(player)) {
+            path = { origin, cursor };
+        }
+        TrajectoryRenderer::Submit(path, worldCamera, &cursor);
     } else {
         TrajectoryRenderer::Clear();
     }
