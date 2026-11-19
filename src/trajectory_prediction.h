@@ -5,6 +5,7 @@
 
 #include "RE/N/NiPoint3.h"
 #include "RE/N/NiQuaternion.h"
+#include "RE/P/Projectile.h"
 
 namespace RE
 {
@@ -36,4 +37,6 @@ namespace TrajectoryPrediction
         const char*& failureReason);
 
     void CorrectPlayerArrowVelocity(RE::ArrowProjectile* arrow);
+    void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow);
+    bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData);
 }

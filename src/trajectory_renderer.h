@@ -6,6 +6,7 @@ namespace RE
 {
     class NiCamera;
     class NiPoint3;
+    class Projectile;
 }
 
 namespace TrajectoryRenderer
@@ -15,5 +16,9 @@ namespace TrajectoryRenderer
         const std::vector<RE::NiPoint3>& path,
         RE::NiCamera* camera,
         const RE::NiPoint3* cursor = nullptr);
+    void BeginActualProjectileTrace(const RE::Projectile* projectile);
+    void RecordActualProjectilePosition(
+        const RE::Projectile* projectile,
+        const RE::NiPoint3& position);
     void Clear();
 }

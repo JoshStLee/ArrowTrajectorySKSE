@@ -278,7 +278,8 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     // third person, use the world-space trajectory without the misleading dot.
     TrajectoryHUD::SetCrosshairVisible(menu, camera->IsInFirstPerson());
 
-    std::vector<RE::NiPoint3> path;
+    static thread_local std::vector<RE::NiPoint3> path;
+    path.clear();
     RE::NiPoint3 hitPosition{};
     bool hit = false;
     if (usingBow) {

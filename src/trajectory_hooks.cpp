@@ -4,6 +4,7 @@
 #include "trajectory_renderer.h"
 
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 
 extern "C"
@@ -17,12 +18,18 @@ namespace
 {
     using CameraStateUpdate = void (*)(RE::TESCameraState*, RE::BSTSmartPointer<RE::TESCameraState>&);
     using ArrowFlightPathUpdate = void (*)(RE::Projectile*);
+    using ProjectileLaunch = RE::ProjectileHandle* (*)(RE::ProjectileHandle*, RE::Projectile::LaunchData&) noexcept;
+    using ArrowUpdateImpl = void (*)(RE::ArrowProjectile*, float);
     using MenuAdvanceMovie = void (*)(RE::HUDMenu*, float, std::uint32_t);
 
     std::unordered_map<std::uintptr_t, CameraStateUpdate> g_originalCameraStateUpdates;
+    std::unordered_map<std::uintptr_t, ArrowUpdateImpl> g_originalArrowUpdateImpls;
+    std::mutex g_arrowUpdateImplMutex;
     ArrowFlightPathUpdate g_originalArrowFlightPathUpdate = nullptr;
+    ProjectileLaunch g_originalProjectileLaunch = nullptr;
     MenuAdvanceMovie g_originalHUDAdvanceMovie = nullptr;
     bool g_arrowFlightPathHookInstalled = false;
+    bool g_projectileLaunchHookInstalled = false;
     bool g_hudAdvanceHookInstalled = false;
     bool g_reportedFirstUpdate = false;
     bool g_attackInputHeld = false;
@@ -96,12 +103,78 @@ namespace
 
     ActionEventSink g_actionEventSink;
 
+    void ArrowProjectileUpdateImplHook(RE::ArrowProjectile* arrow, float delta);
+
+    bool InstallArrowProjectileUpdateHook(RE::ArrowProjectile* arrow)
+    {
+        if (!arrow) {
+            return false;
+        }
+
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(arrow);
+        std::scoped_lock lock(g_arrowUpdateImplMutex);
+        if (g_originalArrowUpdateImpls.contains(vtableAddress)) {
+            return true;
+        }
+
+        REL::Relocation<std::uintptr_t> vtable{ vtableAddress };
+        const auto original = vtable.write_vfunc(0xAB, ArrowProjectileUpdateImplHook);
+        if (!original) {
+            logger::error("Failed to hook ArrowProjectile::UpdateImpl for vtable {:X}.", vtableAddress);
+            return false;
+        }
+        g_originalArrowUpdateImpls.emplace(vtableAddress, reinterpret_cast<ArrowUpdateImpl>(original));
+        logger::info("Hooked ArrowProjectile::UpdateImpl for vtable {:X}.", vtableAddress);
+        return true;
+    }
+
+    void ArrowProjectileUpdateImplHook(RE::ArrowProjectile* arrow, float delta)
+    {
+        if (!arrow) {
+            return;
+        }
+
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(arrow);
+        ArrowUpdateImpl original = nullptr;
+        {
+            std::scoped_lock lock(g_arrowUpdateImplMutex);
+            const auto found = g_originalArrowUpdateImpls.find(vtableAddress);
+            if (found != g_originalArrowUpdateImpls.end()) {
+                original = found->second;
+            }
+        }
+        TrajectoryPrediction::ApplyPendingMountedArrowVelocity(arrow);
+        if (original) {
+            original(arrow, delta);
+        }
+        const auto& projectileData = arrow->GetProjectileRuntimeData();
+        const auto* projectile3D = arrow->Get3D();
+        const auto position = projectile3D
+            ? projectile3D->world.translate
+            : projectileData.unk0A8.translate;
+        TrajectoryRenderer::RecordActualProjectilePosition(arrow, position);
+    }
+
     void ArrowFlightPathUpdateHook(RE::Projectile* projectile)
     {
         if (g_originalArrowFlightPathUpdate) {
             g_originalArrowFlightPathUpdate(projectile);
         }
-        TrajectoryPrediction::CorrectPlayerArrowVelocity(skyrim_cast<RE::ArrowProjectile*>(projectile));
+        const auto arrow = skyrim_cast<RE::ArrowProjectile*>(projectile);
+        if (arrow) {
+            InstallArrowProjectileUpdateHook(arrow);
+        }
+        TrajectoryPrediction::CorrectPlayerArrowVelocity(arrow);
+    }
+
+    RE::ProjectileHandle* ProjectileLaunchHook(
+        RE::ProjectileHandle* result,
+        RE::Projectile::LaunchData& launchData) noexcept
+    {
+        TrajectoryPrediction::CorrectMountedArrowLaunchData(launchData);
+        return g_originalProjectileLaunch
+            ? g_originalProjectileLaunch(result, launchData)
+            : nullptr;
     }
 
     void HUDAdvanceMovieHook(RE::HUDMenu* menu, float interval, std::uint32_t currentTime)
@@ -183,6 +256,32 @@ bool Trajectory::Install()
                 } else {
                     g_arrowFlightPathHookInstalled = true;
                     logger::info("SmoothCam-style player arrow velocity hook installed on UpdateArrowFlightPath.");
+                }
+            }
+        }
+    }
+
+    if (!g_projectileLaunchHookInstalled) {
+        constexpr int kMhOk = 0;
+        constexpr int kMhAlreadyInitialized = 1;
+        const auto initializeStatus = MH_Initialize();
+        if (initializeStatus != kMhOk && initializeStatus != kMhAlreadyInitialized) {
+            logger::error("Failed to initialize MinHook for mounted arrow launch correction: status={}", static_cast<int>(initializeStatus));
+        } else {
+            static REL::Relocation<std::uintptr_t> projectileLaunch{ REL::RelocationID(42928, 44108) };
+            const auto createStatus = MH_CreateHook(
+                reinterpret_cast<void*>(projectileLaunch.address()),
+                reinterpret_cast<void*>(ProjectileLaunchHook),
+                reinterpret_cast<void**>(&g_originalProjectileLaunch));
+            if (createStatus != kMhOk) {
+                logger::error("Failed to create mounted arrow launch hook: status={}", static_cast<int>(createStatus));
+            } else {
+                const auto enableStatus = MH_EnableHook(reinterpret_cast<void*>(projectileLaunch.address()));
+                if (enableStatus != kMhOk) {
+                    logger::error("Failed to enable mounted arrow launch hook: status={}", static_cast<int>(enableStatus));
+                } else {
+                    g_projectileLaunchHookInstalled = true;
+                    logger::info("Mounted arrow launch correction installed at projectile creation.");
                 }
             }
         }

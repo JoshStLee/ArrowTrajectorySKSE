@@ -1,9 +1,13 @@
 #include "pch.h"
 #include "trajectory_prediction.h"
+#include "trajectory_renderer.h"
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace TrajectoryPrediction
@@ -43,6 +47,24 @@ namespace
         kSmoothCamCollisionMask |
         (1ULL << std::to_underlying(RE::COL_LAYER::kDeadBip));
 
+    struct PreviewLaunchData
+    {
+        RE::NiPoint3 origin;
+        RE::NiPoint3 velocity;
+        AimRotation aim;
+    };
+
+    struct PendingMountedArrowLaunch
+    {
+        RE::NiPoint3 velocity;
+    };
+
+    std::unordered_set<std::uintptr_t> g_correctedMountedArrows;
+    std::deque<std::uintptr_t> g_recentMountedArrows;
+    std::unordered_map<std::uintptr_t, PendingMountedArrowLaunch> g_pendingMountedArrowLaunches;
+    std::optional<PreviewLaunchData> g_lastMountedPreview;
+    bool g_reportedRepeatedMountedArrowUpdate = false;
+
     struct BowDrawTimerEntry
     {
         float drawTime;
@@ -67,6 +89,26 @@ namespace
         };
     }
 
+    bool WasMountedArrowCorrected(const RE::ArrowProjectile* arrow)
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(arrow);
+        return g_correctedMountedArrows.contains(address);
+    }
+
+    void RememberMountedArrowCorrected(const RE::ArrowProjectile* arrow)
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(arrow);
+        if (!g_correctedMountedArrows.insert(address).second) {
+            return;
+        }
+        g_recentMountedArrows.push_back(address);
+        constexpr std::size_t kTrackedMountedArrows = 256;
+        if (g_recentMountedArrows.size() > kTrackedMountedArrows) {
+            g_correctedMountedArrows.erase(g_recentMountedArrows.front());
+            g_recentMountedArrows.pop_front();
+        }
+    }
+
     void CorrectPlayerArrowVelocityInternal(RE::ArrowProjectile* arrow)
     {
         const auto player = RE::PlayerCharacter::GetSingleton();
@@ -79,14 +121,21 @@ namespace
             return;
         }
 
-        if (player->IsOnMount()) {
-            static bool reportedMountedArrowCorrectionBypass = false;
-            if (!reportedMountedArrowCorrectionBypass) {
-                logger::info("Mounted player arrow keeps Skyrim's native flight velocity.");
-                reportedMountedArrowCorrectionBypass = true;
+        // Mounted aim can move as the horse camera updates. Match the aim at
+        // launch once, then let the arrow keep that velocity through flight.
+        if (WasMountedArrowCorrected(arrow)) {
+            if (player->IsOnMount() && !g_reportedRepeatedMountedArrowUpdate) {
+                logger::info(
+                    "Mounted arrow flight-path update ran again after correction: arrow=0x{:X}, velocity=({:.1f},{:.1f},{:.1f}).",
+                    reinterpret_cast<std::uintptr_t>(arrow),
+                    projectileData.linearVelocity.x,
+                    projectileData.linearVelocity.y,
+                    projectileData.linearVelocity.z);
+                g_reportedRepeatedMountedArrowUpdate = true;
             }
             return;
         }
+        const auto nativeVelocity = projectileData.linearVelocity;
 
         const auto playerCamera = RE::PlayerCamera::GetSingleton();
         const auto thirdPersonState = playerCamera
@@ -97,11 +146,17 @@ namespace
         }
 
         auto aim = GetAimRotationInternal(thirdPersonState->rotation);
-        if (thirdPersonState->freeRotationEnabled) {
+        if (thirdPersonState->freeRotationEnabled && !player->IsOnMount()) {
             aim.yaw = player->GetAngleZ();
         }
+        const auto cameraAim = aim;
 
-        if ((projectileData.flags.underlying() & (1u << 31)) != 0) {
+        // Mounted prediction is built from the third-person camera rotation.
+        // Keep the released arrow on that same rotation too; using the arrow's
+        // animation angles here makes the shot diverge from the mounted guide.
+        const bool useProjectileAngles =
+            (projectileData.flags.underlying() & (1u << 31)) != 0 && !player->IsOnMount();
+        if (useProjectileAngles) {
             aim.pitch = arrow->GetAngleX();
             aim.yaw = arrow->GetAngleZ();
         } else {
@@ -128,12 +183,48 @@ namespace
 
         const auto velocityScale =
             getWeaponSpeedMultiplier(arrow) * getDrawPower(arrow) * speed * projectileData.speedMult;
-        const auto pitchCos = std::cos(aim.pitch);
-        projectileData.linearVelocity = {
-            pitchCos * std::sin(aim.yaw) * velocityScale,
-            pitchCos * std::cos(aim.yaw) * velocityScale,
-            std::sin(aim.pitch) * velocityScale
-        };
+        if (player->IsOnMount() && g_lastMountedPreview) {
+            // The mounted preview already simulates the exact launch vector
+            // used to draw the visible path. Reuse that vector at release so
+            // the arrow cannot take a separate camera or animation angle.
+            // Queue it for the movement hook too: Skyrim can rebuild projectile
+            // velocity after UpdateArrowFlightPath and before its first step.
+            projectileData.linearVelocity = g_lastMountedPreview->velocity;
+            g_pendingMountedArrowLaunches.insert_or_assign(
+                reinterpret_cast<std::uintptr_t>(arrow),
+                PendingMountedArrowLaunch{ g_lastMountedPreview->velocity });
+        } else {
+            const auto pitchCos = std::cos(aim.pitch);
+            projectileData.linearVelocity = {
+                pitchCos * std::sin(aim.yaw) * velocityScale,
+                pitchCos * std::cos(aim.yaw) * velocityScale,
+                std::sin(aim.pitch) * velocityScale
+            };
+        }
+
+        if (player->IsOnMount()) {
+            if (g_lastMountedPreview) {
+                logger::info(
+                    "Mounted shot diagnostic: arrow=0x{:X}, nativeVelocity=({:.1f},{:.1f},{:.1f}), correctedVelocity=({:.1f},{:.1f},{:.1f}), correctionAim=(yaw {:.2f}, pitch {:.2f}), previewOrigin=({:.1f},{:.1f},{:.1f}), previewVelocity=({:.1f},{:.1f},{:.1f}), previewAim=(yaw {:.2f}, pitch {:.2f}).",
+                    reinterpret_cast<std::uintptr_t>(arrow),
+                    nativeVelocity.x, nativeVelocity.y, nativeVelocity.z,
+                    projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
+                    cameraAim.yaw * 57.29577951308232f, cameraAim.pitch * 57.29577951308232f,
+                    g_lastMountedPreview->origin.x, g_lastMountedPreview->origin.y, g_lastMountedPreview->origin.z,
+                    g_lastMountedPreview->velocity.x, g_lastMountedPreview->velocity.y, g_lastMountedPreview->velocity.z,
+                    g_lastMountedPreview->aim.yaw * 57.29577951308232f,
+                    g_lastMountedPreview->aim.pitch * 57.29577951308232f);
+            } else {
+                logger::info(
+                    "Mounted shot diagnostic: arrow=0x{:X}, no preview sample, nativeVelocity=({:.1f},{:.1f},{:.1f}), correctedVelocity=({:.1f},{:.1f},{:.1f}), correctionAim=(yaw {:.2f}, pitch {:.2f}).",
+                    reinterpret_cast<std::uintptr_t>(arrow),
+                    nativeVelocity.x, nativeVelocity.y, nativeVelocity.z,
+                    projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
+                    cameraAim.yaw * 57.29577951308232f, cameraAim.pitch * 57.29577951308232f);
+            }
+            RememberMountedArrowCorrected(arrow);
+            TrajectoryRenderer::BeginActualProjectileTrace(arrow);
+        }
 
     }
 
@@ -187,10 +278,12 @@ namespace
             }
 
             earlyOutHitFraction = hitInfo.hitFraction;
-            hits.emplace_back(hitInfo.hitFraction, avObject);
+            closestHitFraction = hitInfo.hitFraction;
+            hasHit = true;
         }
 
-        std::vector<std::pair<float, RE::NiAVObject*>> hits;
+        float closestHitFraction = 1.0f;
+        bool hasHit = false;
         const RE::NiAVObject* ignoredObject;
         std::uint64_t collisionMask;
     };
@@ -237,13 +330,10 @@ namespace
         pickData.closestRayHitCollector = &collector;
         world->PickObject(pickData);
 
-        if (collector.hits.empty()) {
+        if (!collector.hasHit) {
             return std::nullopt;
         }
-        const auto closest = std::min_element(
-            collector.hits.begin(), collector.hits.end(),
-            [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
-        return start + delta * closest->first;
+        return start + delta * collector.closestHitFraction;
     }
 
     float GetBowDrawStrength(const RE::PlayerCharacter* player)
@@ -359,7 +449,14 @@ namespace
         // Horse camera keeps the node's world position unchanged.
         const auto playerPosition = player3D->world.translate;
         RE::NiPoint3 start = arrowNode->world.translate;
-        if (!player->IsOnMount()) {
+        if (player->IsOnMount()) {
+            // Projectile::LaunchArrow runs Unk_A0 on this same weapon node
+            // before it creates the projectile. Mirror that launch-origin
+            // adjustment; the raw node position is not the arrow's spawn point.
+            float launchPitch = 0.0f;
+            float launchYaw = 0.0f;
+            player->Unk_A0(arrowNode, launchPitch, launchYaw, start);
+        } else {
             const auto arrowOffset = arrowNode->world.translate - playerPosition;
             const auto yawDelta = player->GetAngleZ() - aim.yaw;
             const auto yawCos = std::cos(yawDelta);
@@ -396,6 +493,9 @@ namespace
         }
         const auto weaponSpeedMultiplier = (speedLowerLimit - weaponSpeed) * speedMultiplier + 1.0f;
         auto velocity = direction * (projectile->data.speed * drawStrength * weaponSpeedMultiplier);
+        if (player->IsOnMount()) {
+            g_lastMountedPreview = PreviewLaunchData{ start, ToNi(velocity), aim };
+        }
 
         auto worldGravity = PhysicsVector{ 0.0f, 0.0f, -9.8f };
         if (const auto cell = player->GetParentCell(); cell && cell->GetbhkWorld() && cell->GetbhkWorld()->GetWorld1()) {
@@ -474,5 +574,48 @@ bool SimulateArrow(
 void CorrectPlayerArrowVelocity(RE::ArrowProjectile* arrow)
 {
     CorrectPlayerArrowVelocityInternal(arrow);
+}
+
+void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow)
+{
+    if (!arrow) {
+        return;
+    }
+
+    const auto pending = g_pendingMountedArrowLaunches.find(reinterpret_cast<std::uintptr_t>(arrow));
+    if (pending == g_pendingMountedArrowLaunches.end()) {
+        return;
+    }
+
+    arrow->GetProjectileRuntimeData().linearVelocity = pending->second.velocity;
+    const auto& velocity = pending->second.velocity;
+    const auto horizontalSpeed = std::hypot(velocity.x, velocity.y);
+    const auto arrowPitch = -std::atan2(velocity.z, horizontalSpeed);
+    const auto arrowYaw = std::atan2(velocity.x, velocity.y);
+    auto angle = arrow->GetAngle();
+    angle.x = arrowPitch;
+    angle.z = arrowYaw;
+    arrow->SetAngle(angle);
+    g_pendingMountedArrowLaunches.erase(pending);
+}
+
+bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData)
+{
+    const auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player || !player->IsOnMount() || launchData.shooter != player ||
+        !launchData.weaponSource || !launchData.ammoSource || !g_lastMountedPreview) {
+        return false;
+    }
+
+    const auto& velocity = g_lastMountedPreview->velocity;
+
+    // Correct the launch parameters before Skyrim creates the projectile.
+    // This makes the engine's initial arrow orientation and spawn point use
+    // the same aim vector as the mounted trajectory preview in every direction.
+    launchData.origin = g_lastMountedPreview->origin;
+    launchData.angleZ = std::atan2(velocity.x, velocity.y);
+    launchData.angleX = -std::atan2(velocity.z, std::hypot(velocity.x, velocity.y));
+    launchData.useOrigin = true;
+    return true;
 }
 }

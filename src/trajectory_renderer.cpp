@@ -38,6 +38,10 @@ namespace
 
     std::mutex g_pathMutex;
     std::vector<ScreenPoint> g_screenPath;
+    std::vector<ScreenPoint> g_screenActualPath;
+    std::vector<RE::NiPoint3> g_actualWorldPath;
+    const RE::Projectile* g_tracedProjectile = nullptr;
+    std::size_t g_actualTraceSegmentCount = 0;
     std::optional<ScreenPoint> g_screenCursor;
     std::vector<Vertex> g_vertices;
     RE::BSGraphics::Renderer* g_renderer = nullptr;
@@ -179,7 +183,7 @@ namespace
         }
 
         REX::W32::D3D11_BUFFER_DESC bufferDescription{};
-        bufferDescription.byteWidth = static_cast<std::uint32_t>(sizeof(Vertex) * (6 * 128 + 6 * 32));
+        bufferDescription.byteWidth = static_cast<std::uint32_t>(sizeof(Vertex) * (6 * (128 + 2048) + 6 * 32));
         bufferDescription.usage = REX::W32::D3D11_USAGE_DYNAMIC;
         bufferDescription.bindFlags = REX::W32::D3D11_BIND_VERTEX_BUFFER;
         bufferDescription.cpuAccessFlags = REX::W32::D3D11_CPU_ACCESS_WRITE;
@@ -235,13 +239,15 @@ namespace
     void DrawSubmittedPath()
     {
         std::vector<ScreenPoint> path;
+        std::vector<ScreenPoint> actualPath;
         std::optional<ScreenPoint> cursor;
         {
             std::scoped_lock lock(g_pathMutex);
             path = g_screenPath;
+            actualPath = g_screenActualPath;
             cursor = g_screenCursor;
         }
-        if (path.size() < 2 && !cursor) {
+        if (path.size() < 2 && actualPath.size() < 2 && !cursor) {
             return;
         }
         if (!g_pipelineReady && !CreatePipeline()) {
@@ -260,75 +266,70 @@ namespace
         const auto height = static_cast<float>(renderWindow->windowHeight);
 
         g_vertices.clear();
-        g_vertices.reserve((path.size() > 1 ? (path.size() - 1) * 6 : 0) + (cursor ? 6 * 32 : 0));
-        const auto toClip = [width, height](float x, float y, float depth, float alpha) {
-            return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, 1.0f, 1.0f, 1.0f, alpha };
-        };
+        g_vertices.reserve((path.size() + actualPath.size()) * 6 + (cursor ? 6 * 32 : 0));
         const auto toClipColor = [width, height](float x, float y, float depth, float red, float green, float blue) {
             return Vertex{ 2.0f * x / width - 1.0f, 1.0f - 2.0f * y / height, depth, red, green, blue, 1.0f };
         };
-        for (std::size_t i = 1; i < path.size(); ++i) {
-            auto a = path[i - 1];
-            auto b = path[i];
-            if (!std::isfinite(a.x) || !std::isfinite(a.y) ||
-                !std::isfinite(b.x) || !std::isfinite(b.y))
-            {
-                continue;
-            }
-
-            const auto dx = b.x - a.x;
-            const auto dy = b.y - a.y;
-            const auto dz = b.depth - a.depth;
-            const auto length = std::sqrt(dx * dx + dy * dy);
-            if (!std::isfinite(length) || length < 0.01f) {
-                continue;
-            }
-
-            float t0 = 0.0f;
-            float t1 = 1.0f;
-            const auto clip = [&t0, &t1](float p, float q) {
-                if (std::abs(p) < 1.0e-6f) {
-                    return q >= 0.0f;
+        const auto appendPath = [&](const std::vector<ScreenPoint>& points, float red, float green, float blue, bool taper) {
+            for (std::size_t i = 1; i < points.size(); ++i) {
+                auto a = points[i - 1];
+                auto b = points[i];
+                if (!std::isfinite(a.x) || !std::isfinite(a.y) ||
+                    !std::isfinite(b.x) || !std::isfinite(b.y)) {
+                    continue;
                 }
-                const auto t = q / p;
-                if (p < 0.0f) {
-                    t0 = (std::max)(t0, t);
-                } else {
-                    t1 = (std::min)(t1, t);
-                }
-                return t0 <= t1;
-            };
-            if (!clip(-dx, a.x) || !clip(dx, width - a.x) ||
-                !clip(-dy, a.y) || !clip(dy, height - a.y))
-            {
-                continue;
-            }
-            b = { a.x + dx * t1, a.y + dy * t1 };
-            b.depth = path[i - 1].depth + dz * t1;
-            a = { path[i - 1].x + dx * t0, path[i - 1].y + dy * t0, path[i - 1].depth + dz * t0 };
 
-            // SmoothCam fades its arrow tail across the sampled path. Use a
-            // matching distance-based taper for this solid white trajectory.
-            const auto progress = static_cast<float>(i) / static_cast<float>(path.size() - 1);
-            const auto halfWidth = 2.5f + (1.1f - 2.5f) * progress;
-            const auto previousProgress = static_cast<float>(i - 1) / static_cast<float>(path.size() - 1);
-            const auto alphaAt = [](float distance) {
-                // Make the launch direction easy to read, then de-emphasize
-                // the far ballistic arc, where small velocity errors accumulate.
-                const auto fadeIn = std::clamp(distance / 0.08f, 0.0f, 1.0f);
-                const auto fadeOut = 0.92f - 0.78f * distance;
-                return std::clamp(fadeIn * fadeOut, 0.0f, 1.0f);
-            };
-            const auto alphaA = alphaAt(previousProgress + (progress - previousProgress) * t0);
-            const auto alphaB = alphaAt(previousProgress + (progress - previousProgress) * t1);
-            const auto normalX = -dy / length * halfWidth;
-            const auto normalY = dx / length * halfWidth;
-            const auto a0 = toClip(a.x + normalX, a.y + normalY, a.depth, alphaA);
-            const auto a1 = toClip(a.x - normalX, a.y - normalY, a.depth, alphaA);
-            const auto b0 = toClip(b.x + normalX, b.y + normalY, b.depth, alphaB);
-            const auto b1 = toClip(b.x - normalX, b.y - normalY, b.depth, alphaB);
-            g_vertices.insert(g_vertices.end(), { a0, a1, b0, b0, a1, b1 });
-        }
+                const auto dx = b.x - a.x;
+                const auto dy = b.y - a.y;
+                const auto dz = b.depth - a.depth;
+                const auto length = std::sqrt(dx * dx + dy * dy);
+                if (!std::isfinite(length) || length < 0.01f) {
+                    continue;
+                }
+
+                float t0 = 0.0f;
+                float t1 = 1.0f;
+                const auto clip = [&t0, &t1](float p, float q) {
+                    if (std::abs(p) < 1.0e-6f) return q >= 0.0f;
+                    const auto t = q / p;
+                    if (p < 0.0f) t0 = (std::max)(t0, t);
+                    else t1 = (std::min)(t1, t);
+                    return t0 <= t1;
+                };
+                if (!clip(-dx, a.x) || !clip(dx, width - a.x) ||
+                    !clip(-dy, a.y) || !clip(dy, height - a.y)) {
+                    continue;
+                }
+                b = { a.x + dx * t1, a.y + dy * t1 };
+                b.depth = points[i - 1].depth + dz * t1;
+                a = { points[i - 1].x + dx * t0, points[i - 1].y + dy * t0, points[i - 1].depth + dz * t0 };
+
+                const auto progress = static_cast<float>(i) / static_cast<float>(points.size() - 1);
+                const auto halfWidth = taper ? 2.5f + (1.1f - 2.5f) * progress : 1.5f;
+                const auto alphaAt = [taper](float distance) {
+                    if (!taper) return 0.95f;
+                    const auto fadeIn = std::clamp(distance / 0.08f, 0.0f, 1.0f);
+                    return std::clamp(fadeIn * (0.92f - 0.78f * distance), 0.0f, 1.0f);
+                };
+                const auto previousProgress = static_cast<float>(i - 1) / static_cast<float>(points.size() - 1);
+                const auto alphaA = alphaAt(previousProgress + (progress - previousProgress) * t0);
+                const auto alphaB = alphaAt(previousProgress + (progress - previousProgress) * t1);
+                const auto normalX = -dy / length * halfWidth;
+                const auto normalY = dx / length * halfWidth;
+                const auto makeVertex = [&](float x, float y, float depth, float alpha) {
+                    auto vertex = toClipColor(x, y, depth, red, green, blue);
+                    vertex.alpha = alpha;
+                    return vertex;
+                };
+                const auto a0 = makeVertex(a.x + normalX, a.y + normalY, a.depth, alphaA);
+                const auto a1 = makeVertex(a.x - normalX, a.y - normalY, a.depth, alphaA);
+                const auto b0 = makeVertex(b.x + normalX, b.y + normalY, b.depth, alphaB);
+                const auto b1 = makeVertex(b.x - normalX, b.y - normalY, b.depth, alphaB);
+                g_vertices.insert(g_vertices.end(), { a0, a1, b0, b0, a1, b1 });
+            }
+        };
+        appendPath(path, 1.0f, 1.0f, 1.0f, true);
+        appendPath(actualPath, 0.1f, 0.9f, 1.0f, false);
         const auto lineVertexCount = g_vertices.size();
         if (cursor && std::isfinite(cursor->x) && std::isfinite(cursor->y) &&
             cursor->x >= 0.0f && cursor->x <= width && cursor->y >= 0.0f && cursor->y <= height)
@@ -540,9 +541,17 @@ void TrajectoryRenderer::Submit(
     RE::NiCamera* camera,
     const RE::NiPoint3* cursor)
 {
-    std::vector<ScreenPoint> projected;
+    static thread_local std::vector<ScreenPoint> projected;
+    static thread_local std::vector<ScreenPoint> projectedActual;
+    std::vector<RE::NiPoint3> actualWorldPath;
+    {
+        std::scoped_lock lock(g_pathMutex);
+        actualWorldPath = g_actualWorldPath;
+    }
+    projected.clear();
+    projectedActual.clear();
     std::optional<ScreenPoint> projectedCursor;
-    if (!camera || (path.size() < 2 && !cursor)) {
+    if (!camera || (path.size() < 2 && !cursor && actualWorldPath.size() < 2)) {
         Clear();
         return;
     }
@@ -604,6 +613,22 @@ void TrajectoryRenderer::Submit(
         }
     }
 
+    projectedActual.reserve(actualWorldPath.size());
+    for (const auto& point : actualWorldPath) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+            const auto invalid = std::numeric_limits<float>::quiet_NaN();
+            projectedActual.push_back({ invalid, invalid, invalid });
+            continue;
+        }
+        const auto screenPoint = project(point);
+        if (screenPoint) {
+            projectedActual.push_back(*screenPoint);
+        } else {
+            const auto invalid = std::numeric_limits<float>::quiet_NaN();
+            projectedActual.push_back({ invalid, invalid, invalid });
+        }
+    }
+
     if (cursor) {
         projectedCursor = project(*cursor);
         if (projectedCursor && !g_cursorProjectionReported) {
@@ -620,7 +645,11 @@ void TrajectoryRenderer::Submit(
         projected.begin(), projected.end(), [](const auto& point) {
             return std::isfinite(point.x) && std::isfinite(point.y);
         }));
-    if (visiblePoints < 2 && !projectedCursor) {
+    const auto visibleActualPoints = static_cast<std::size_t>(std::count_if(
+        projectedActual.begin(),
+        projectedActual.end(),
+        [](const auto& point) { return std::isfinite(point.x) && std::isfinite(point.y); }));
+    if (visiblePoints < 2 && visibleActualPoints < 2 && !projectedCursor) {
         if (!g_projectionFailureReported) {
             logger::warn(
                 "Trajectory native projection produced only {} projectable points from {} world points.",
@@ -634,7 +663,79 @@ void TrajectoryRenderer::Submit(
     {
         std::scoped_lock lock(g_pathMutex);
         g_screenPath = std::move(projected);
+        g_screenActualPath = std::move(projectedActual);
         g_screenCursor = projectedCursor;
+    }
+}
+
+void TrajectoryRenderer::BeginActualProjectileTrace(const RE::Projectile* projectile)
+{
+    std::scoped_lock lock(g_pathMutex);
+    g_tracedProjectile = projectile;
+    g_actualWorldPath.clear();
+    g_screenActualPath.clear();
+    g_actualTraceSegmentCount = 0;
+    if (projectile) {
+        const auto& projectileData = projectile->GetProjectileRuntimeData();
+        const auto* projectile3D = projectile->Get3D();
+        const auto position = projectile3D
+            ? projectile3D->world.translate
+            : projectileData.unk0A8.translate;
+        g_actualWorldPath.push_back(position);
+        logger::info(
+            "Mounted actual projectile position trace started: arrow=0x{:X}, position=({:.1f},{:.1f},{:.1f}), source={}",
+            reinterpret_cast<std::uintptr_t>(projectile),
+            position.x, position.y, position.z,
+            projectile3D ? "3D world transform" : "runtime transform");
+    }
+}
+
+void TrajectoryRenderer::RecordActualProjectilePosition(
+    const RE::Projectile* projectile,
+    const RE::NiPoint3& position)
+{
+    if (!projectile || !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+        return;
+    }
+
+    std::scoped_lock lock(g_pathMutex);
+    if (projectile != g_tracedProjectile) {
+        return;
+    }
+
+    if (g_actualTraceSegmentCount == 0) {
+        const auto& projectileData = projectile->GetProjectileRuntimeData();
+        const auto& previous = g_actualWorldPath.back();
+        const auto* projectile3D = projectile->Get3D();
+        const auto nodePosition = projectile3D
+            ? projectile3D->world.translate
+            : RE::NiPoint3{};
+        const auto runtimePosition = projectileData.unk0A8.translate;
+        const auto referencePosition = projectile->GetPosition();
+        logger::info(
+            "Mounted actual projectile first movement: arrow=0x{:X}, velocity=({:.1f},{:.1f},{:.1f}), start=({:.1f},{:.1f},{:.1f}), sampled=({:.1f},{:.1f},{:.1f}), delta=({:.1f},{:.1f},{:.1f}), node=({:.1f},{:.1f},{:.1f}), runtime=({:.1f},{:.1f},{:.1f}), ref=({:.1f},{:.1f},{:.1f}).",
+            reinterpret_cast<std::uintptr_t>(projectile),
+            projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
+            previous.x, previous.y, previous.z,
+            position.x, position.y, position.z,
+            position.x - previous.x, position.y - previous.y, position.z - previous.z,
+            nodePosition.x, nodePosition.y, nodePosition.z,
+            runtimePosition.x, runtimePosition.y, runtimePosition.z,
+            referencePosition.x, referencePosition.y, referencePosition.z);
+    }
+    ++g_actualTraceSegmentCount;
+
+    constexpr std::size_t kMaxActualTracePoints = 2048;
+    const auto& previous = g_actualWorldPath.back();
+    const auto dx = position.x - previous.x;
+    const auto dy = position.y - previous.y;
+    const auto dz = position.z - previous.z;
+    if (dx * dx + dy * dy + dz * dz > 0.01f) {
+        g_actualWorldPath.push_back(position);
+    }
+    if (g_actualWorldPath.size() > kMaxActualTracePoints) {
+        const auto removeCount = g_actualWorldPath.size() - kMaxActualTracePoints;
+        g_actualWorldPath.erase(g_actualWorldPath.begin(), g_actualWorldPath.begin() + removeCount);
     }
 }
 
