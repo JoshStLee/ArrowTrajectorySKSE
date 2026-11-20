@@ -5,6 +5,8 @@
 #include "trajectory_renderer.h"
 
 #include <cmath>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 namespace
@@ -17,6 +19,21 @@ namespace
     bool g_reportedPredictionHit = false;
     bool g_reportedMagicRayResult = false;
     bool g_reportedNoAmmo = false;
+
+    std::mutex g_mountedSpellPreviewMutex;
+    std::optional<RE::NiPoint3> g_mountedSpellTarget;
+
+    void SetMountedSpellTarget(std::optional<RE::NiPoint3> target)
+    {
+        std::scoped_lock lock(g_mountedSpellPreviewMutex);
+        g_mountedSpellTarget = std::move(target);
+    }
+
+    std::optional<RE::NiPoint3> GetMountedSpellTarget()
+    {
+        std::scoped_lock lock(g_mountedSpellPreviewMutex);
+        return g_mountedSpellTarget;
+    }
 
     float Dot(const RE::NiPoint3& lhs, const RE::NiPoint3& rhs)
     {
@@ -108,12 +125,14 @@ namespace
         RE::NiPoint3 origin;
         RE::NiPoint3 direction;
         float yaw;
+        bool mountedHandOrigin;
     };
 
     AimRay GetSharedAimRay(
         RE::PlayerCharacter* player,
         RE::PlayerCamera* playerCamera,
-        RE::NiCamera* worldCamera)
+        RE::NiCamera* worldCamera,
+        bool useMountedSpellOrigin = false)
     {
         auto direction = Normalize(worldCamera->world.rotate.GetVectorY());
         auto yaw = std::atan2(direction.x, direction.y);
@@ -134,13 +153,27 @@ namespace
         }
 
         auto origin = worldCamera->world.translate;
+        bool mountedHandOrigin = false;
         const auto player3D = player->Get3D();
         static const RE::BSFixedString headMagicNodeName("NPC Head MagicNode [Hmag]");
         if (player3D) {
-            if (const auto* magicNode = player3D->GetObjectByName(headMagicNodeName)) {
+            const RE::NiAVObject* magicNode = nullptr;
+            if (player->IsOnMount() && useMountedSpellOrigin) {
+                static const RE::BSFixedString rightHandNodeName("NPC R Hand [RHnd]");
+                static const RE::BSFixedString rightHandNodeFallbackName("NPC R Hand");
+                magicNode = player3D->GetObjectByName(rightHandNodeName);
+                if (!magicNode) {
+                    magicNode = player3D->GetObjectByName(rightHandNodeFallbackName);
+                }
+                mountedHandOrigin = magicNode != nullptr;
+            }
+            if (!magicNode) {
+                magicNode = player3D->GetObjectByName(headMagicNodeName);
+            }
+            if (magicNode) {
                 if (player->IsOnMount()) {
                     // Horse camera offsets are already represented by the
-                    // mounted node transform; do not rotate them by actor yaw.
+                    // mounted node transform; do not rotate it by actor yaw.
                     origin = magicNode->world.translate;
                 } else {
                     const auto playerPosition = player3D->world.translate;
@@ -157,7 +190,28 @@ namespace
             }
         }
 
-        return { origin, direction, yaw };
+        return { origin, direction, yaw, mountedHandOrigin };
+    }
+
+    struct MagicAimTarget
+    {
+        RE::NiPoint3 position;
+        bool hit;
+    };
+
+    MagicAimTarget GetMagicAimTarget(
+        RE::PlayerCharacter* player,
+        const AimRay& aimRay)
+    {
+        const auto& direction = aimRay.direction;
+        auto target = aimRay.origin + direction * kAimRayFallbackDistance;
+        if (const auto result = TrajectoryPrediction::CastRay(
+                player,
+                aimRay.origin,
+                aimRay.origin + direction * kAimRaycastDistance)) {
+            return { *result, true };
+        }
+        return { target, false };
     }
 
     bool IsCombatSpellReadied(const RE::Actor* actor, std::size_t slot, const RE::MagicItem* spell)
@@ -233,9 +287,47 @@ namespace
 
 }
 
+bool Trajectory::CorrectMountedSpellLaunchData(RE::Projectile::LaunchData& launchData)
+{
+    const auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player || !player->IsOnMount() || launchData.shooter != player ||
+        launchData.castingSource != RE::MagicSystem::CastingSource::kRightHand ||
+        !launchData.spell || !launchData.projectileBase || !launchData.projectileBase->IsMissile()) {
+        return false;
+    }
+
+    const auto target = GetMountedSpellTarget();
+    if (!target) {
+        return false;
+    }
+
+    // Keep Skyrim's launch-time hand position: mounted casting animations can
+    // move the hand after the last guide update. Aim that actual spawn point at
+    // the guide's cached endpoint instead of reusing the potentially stale one.
+    const auto launchOrigin = launchData.origin;
+    if (!std::isfinite(launchOrigin.x) || !std::isfinite(launchOrigin.y) ||
+        !std::isfinite(launchOrigin.z)) {
+        return false;
+    }
+    const auto offset = *target - launchOrigin;
+    const auto horizontalDistance = std::hypot(offset.x, offset.y);
+    const auto distance = std::hypot(horizontalDistance, offset.z);
+    if (!std::isfinite(distance) || distance <= 0.001f) {
+        return false;
+    }
+
+    // Preserve the engine's current hand spawn point, but force its launch
+    // angles toward the exact endpoint used by the rendered guide.
+    launchData.angleZ = std::atan2(offset.x, offset.y);
+    launchData.angleX = -std::atan2(offset.z, horizontalDistance);
+    launchData.useOrigin = true;
+    return true;
+}
+
 void Trajectory::Update(RE::PlayerCamera* camera)
 {
     if (!camera || !RE::PlayerCharacter::GetSingleton()) {
+        SetMountedSpellTarget(std::nullopt);
         return;
     }
 
@@ -243,6 +335,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     // camera that Skyrim did not update this frame; put the crosshair back instead.
     const auto ui = RE::UI::GetSingleton();
     if (!ui || ui->GameIsPaused()) {
+        SetMountedSpellTarget(std::nullopt);
         if (auto* pausedMenu = TrajectoryHUD::GetMenu(); pausedMenu && TrajectoryHUD::EnsureState(pausedMenu)) {
             TrajectoryRenderer::Clear();
             TrajectoryHUD::Reset(pausedMenu);
@@ -255,6 +348,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     const auto player = RE::PlayerCharacter::GetSingleton();
     auto* menu = TrajectoryHUD::GetMenu();
     if (!TrajectoryHUD::EnsureState(menu)) {
+        SetMountedSpellTarget(std::nullopt);
         TrajectoryRenderer::Clear();
         static bool reportedHUDUnavailable = false;
         if (!reportedHUDUnavailable) {
@@ -266,9 +360,13 @@ void Trajectory::Update(RE::PlayerCamera* camera)
 
     const bool usingMagic = HasCombatMagicReadied(player);
     const bool usingBow = !usingMagic && IsBowOrCrossbowReadied(player);
+    if (!usingMagic || !player->IsOnMount()) {
+        SetMountedSpellTarget(std::nullopt);
+    }
 
     const auto worldCamera = RE::Main::WorldRootCamera();
     if (!worldCamera) {
+        SetMountedSpellTarget(std::nullopt);
         TrajectoryRenderer::Clear();
         TrajectoryHUD::Reset(menu);
         return;
@@ -336,27 +434,27 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         // Use the same third-person camera-state aim rotation as the bow
         // predictor and SmoothCam's magic ray. Unlike the bow, spells travel
         // along this direction without applying gravity or simulating an arc.
-        const auto aimRay = GetSharedAimRay(player, camera, worldCamera);
-        auto normalizedDirection = aimRay.direction;
-        if (Dot(normalizedDirection, normalizedDirection) <= 0.0001f) {
+        const auto mountedSpell = player->IsOnMount();
+        const auto aimRay = GetSharedAimRay(player, camera, worldCamera, mountedSpell);
+        if (Dot(aimRay.direction, aimRay.direction) <= 0.0001f) {
+            SetMountedSpellTarget(std::nullopt);
             DrawCameraGuide(player, worldCamera, true);
             TrajectoryHUD::Center(menu);
             return;
         }
-        normalizedDirection = Normalize(normalizedDirection);
 
         // Match SmoothCam's magic launch point and TranslateFirePostion yaw
         // adjustment so this straight path starts where spell aim originates.
         const auto origin = aimRay.origin;
         // When the collision ray has no hit, keep a visible aim dot along the
         // same camera ray. A real impact always replaces this fallback point.
-        hitPosition = origin + normalizedDirection * kAimRayFallbackDistance;
-        if (const auto result = TrajectoryPrediction::CastRay(
-                player,
-                origin,
-                origin + normalizedDirection * kAimRaycastDistance)) {
-            hitPosition = *result;
-            hit = true;
+        const auto aimTarget = GetMagicAimTarget(player, aimRay);
+        hitPosition = aimTarget.position;
+        hit = aimTarget.hit;
+        if (mountedSpell && aimRay.mountedHandOrigin) {
+            SetMountedSpellTarget(hitPosition);
+        } else {
+            SetMountedSpellTarget(std::nullopt);
         }
         if (!g_reportedMagicRayResult) {
             if (hit) {

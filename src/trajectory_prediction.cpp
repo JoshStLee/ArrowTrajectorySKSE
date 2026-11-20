@@ -59,9 +59,15 @@ namespace
         RE::NiPoint3 velocity;
     };
 
+    struct PendingMountedSpellLaunch
+    {
+        RE::NiPoint3 velocity;
+    };
+
     std::unordered_set<std::uintptr_t> g_correctedMountedArrows;
     std::deque<std::uintptr_t> g_recentMountedArrows;
     std::unordered_map<std::uintptr_t, PendingMountedArrowLaunch> g_pendingMountedArrowLaunches;
+    std::unordered_map<std::uintptr_t, PendingMountedSpellLaunch> g_pendingMountedSpellLaunches;
     std::optional<PreviewLaunchData> g_lastMountedPreview;
 
     struct BowDrawTimerEntry
@@ -191,7 +197,9 @@ namespace
 
         if (player->IsOnMount()) {
             RememberMountedArrowCorrected(arrow);
-            TrajectoryRenderer::BeginActualProjectileTrace(arrow);
+            if (TrajectoryRenderer::IsActualTraceVisible()) {
+                TrajectoryRenderer::BeginActualProjectileTrace(arrow);
+            }
         }
 
     }
@@ -206,8 +214,10 @@ namespace
     public:
         explicit FirstHitCollector(
             const RE::NiAVObject* ignoredObject,
+            const RE::NiAVObject* ignoredMountObject,
             std::uint64_t collisionMask = kSmoothCamCollisionMask) :
             ignoredObject(ignoredObject),
+            ignoredMountObject(ignoredMountObject),
             collisionMask(collisionMask)
         {}
 
@@ -241,7 +251,7 @@ namespace
             const auto avObject = getAVObject(bodyRoot);
             // SmoothCam ignores the player's scene root and treats unresolved
             // Havok bodies as non-hits, matching its crosshair ray behavior.
-            if (!avObject || avObject == ignoredObject) {
+            if (!avObject || avObject == ignoredObject || avObject == ignoredMountObject) {
                 return;
             }
 
@@ -253,6 +263,7 @@ namespace
         float closestHitFraction = 1.0f;
         bool hasHit = false;
         const RE::NiAVObject* ignoredObject;
+        const RE::NiAVObject* ignoredMountObject;
         std::uint64_t collisionMask;
     };
 
@@ -293,7 +304,14 @@ namespace
         pickData.ray = RE::hkVector4(delta.x * scale, delta.y * scale, delta.z * scale, 1.0f);
 
         const auto player3D = player->Get3D();
-        FirstHitCollector collector(player3D, collisionMask);
+        const RE::NiAVObject* mount3D = nullptr;
+        if (player->IsOnMount()) {
+            RE::NiPointer<RE::Actor> mount;
+            if (player->GetMount(mount) && mount) {
+                mount3D = mount->Get3D();
+            }
+        }
+        FirstHitCollector collector(player3D, mount3D, collisionMask);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
         world->PickObject(pickData);
@@ -569,6 +587,61 @@ void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow)
     angle.z = arrowYaw;
     arrow->SetAngle(angle);
     g_pendingMountedArrowLaunches.erase(pending);
+}
+
+bool CorrectMountedSpellProjectileVelocity(
+    RE::Projectile* projectile,
+    const RE::Projectile::LaunchData& launchData)
+{
+    const auto player = RE::PlayerCharacter::GetSingleton();
+    if (!projectile || !player || !player->IsOnMount() ||
+        launchData.shooter != player ||
+        launchData.castingSource != RE::MagicSystem::CastingSource::kRightHand ||
+        !launchData.spell || !launchData.projectileBase || !launchData.projectileBase->IsMissile()) {
+        return false;
+    }
+
+    const auto pitch = -launchData.angleX;
+    const auto yaw = launchData.angleZ;
+    const auto pitchCos = std::cos(pitch);
+    const auto direction = RE::NiPoint3{
+        pitchCos * std::sin(yaw),
+        pitchCos * std::cos(yaw),
+        std::sin(pitch)
+    };
+    auto& projectileData = projectile->GetProjectileRuntimeData();
+    auto speed = std::hypot(
+        projectileData.linearVelocity.x,
+        projectileData.linearVelocity.y,
+        projectileData.linearVelocity.z);
+    if (!std::isfinite(speed) || speed <= 0.001f) {
+        speed = launchData.projectileBase->data.speed;
+    }
+    if (!std::isfinite(speed) || speed <= 0.001f) {
+        return false;
+    }
+
+    const auto velocity = direction * speed;
+    projectileData.linearVelocity = velocity;
+    g_pendingMountedSpellLaunches.insert_or_assign(
+        reinterpret_cast<std::uintptr_t>(projectile),
+        PendingMountedSpellLaunch{ velocity });
+    return true;
+}
+
+void ApplyPendingMountedSpellVelocity(RE::Projectile* projectile)
+{
+    if (!projectile) {
+        return;
+    }
+
+    const auto pending = g_pendingMountedSpellLaunches.find(reinterpret_cast<std::uintptr_t>(projectile));
+    if (pending == g_pendingMountedSpellLaunches.end()) {
+        return;
+    }
+
+    projectile->GetProjectileRuntimeData().linearVelocity = pending->second.velocity;
+    g_pendingMountedSpellLaunches.erase(pending);
 }
 
 bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData)

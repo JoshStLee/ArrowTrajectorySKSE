@@ -677,8 +677,29 @@ void TrajectoryRenderer::Submit(
     }
 }
 
-void TrajectoryRenderer::BeginActualProjectileTrace(const RE::Projectile* projectile)
+void TrajectoryRenderer::BeginActualProjectileTrace(
+    const RE::Projectile* projectile,
+    const RE::NiPoint3* initialPosition)
 {
+    if (!g_actualTraceVisible.load(std::memory_order_relaxed)) {
+        std::scoped_lock lock(g_pathMutex);
+        g_tracedProjectile = nullptr;
+        g_actualWorldPath.clear();
+        g_screenActualPath.clear();
+        return;
+    }
+
+    std::optional<RE::NiPoint3> position;
+    if (projectile) {
+        const auto& projectileData = projectile->GetProjectileRuntimeData();
+        const auto* projectile3D = projectile->Get3D();
+        position = initialPosition
+            ? *initialPosition
+            : projectile3D
+                ? projectile3D->world.translate
+                : projectileData.unk0A8.translate;
+    }
+
     std::scoped_lock lock(g_pathMutex);
     if (!g_actualTraceVisible.load(std::memory_order_relaxed)) {
         g_tracedProjectile = nullptr;
@@ -689,13 +710,8 @@ void TrajectoryRenderer::BeginActualProjectileTrace(const RE::Projectile* projec
     g_tracedProjectile = projectile;
     g_actualWorldPath.clear();
     g_screenActualPath.clear();
-    if (projectile) {
-        const auto& projectileData = projectile->GetProjectileRuntimeData();
-        const auto* projectile3D = projectile->Get3D();
-        const auto position = projectile3D
-            ? projectile3D->world.translate
-            : projectileData.unk0A8.translate;
-        g_actualWorldPath.push_back(position);
+    if (position) {
+        g_actualWorldPath.push_back(*position);
     }
 }
 

@@ -20,11 +20,14 @@ namespace
     using ArrowFlightPathUpdate = void (*)(RE::Projectile*);
     using ProjectileLaunch = RE::ProjectileHandle* (*)(RE::ProjectileHandle*, RE::Projectile::LaunchData&) noexcept;
     using ArrowUpdateImpl = void (*)(RE::ArrowProjectile*, float);
+    using SpellProjectileUpdateImpl = void (*)(RE::Projectile*, float);
     using MenuAdvanceMovie = void (*)(RE::HUDMenu*, float, std::uint32_t);
 
     std::unordered_map<std::uintptr_t, CameraStateUpdate> g_originalCameraStateUpdates;
     std::unordered_map<std::uintptr_t, ArrowUpdateImpl> g_originalArrowUpdateImpls;
+    std::unordered_map<std::uintptr_t, SpellProjectileUpdateImpl> g_originalSpellProjectileUpdateImpls;
     std::mutex g_arrowUpdateImplMutex;
+    std::mutex g_spellProjectileUpdateImplMutex;
     ArrowFlightPathUpdate g_originalArrowFlightPathUpdate = nullptr;
     ProjectileLaunch g_originalProjectileLaunch = nullptr;
     MenuAdvanceMovie g_originalHUDAdvanceMovie = nullptr;
@@ -104,6 +107,32 @@ namespace
     ActionEventSink g_actionEventSink;
 
     void ArrowProjectileUpdateImplHook(RE::ArrowProjectile* arrow, float delta);
+    void SpellProjectileUpdateImplHook(RE::Projectile* projectile, float delta);
+
+    bool InstallMountedSpellProjectileUpdateHook(RE::Projectile* projectile)
+    {
+        if (!projectile) {
+            return false;
+        }
+
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(projectile);
+        std::scoped_lock lock(g_spellProjectileUpdateImplMutex);
+        if (g_originalSpellProjectileUpdateImpls.contains(vtableAddress)) {
+            return true;
+        }
+
+        REL::Relocation<std::uintptr_t> vtable{ vtableAddress };
+        const auto original = vtable.write_vfunc(0xAB, SpellProjectileUpdateImplHook);
+        if (!original) {
+            logger::error("Failed to hook mounted spell projectile UpdateImpl for vtable {:X}.", vtableAddress);
+            return false;
+        }
+        g_originalSpellProjectileUpdateImpls.emplace(
+            vtableAddress,
+            reinterpret_cast<SpellProjectileUpdateImpl>(original));
+        logger::info("Hooked mounted spell projectile UpdateImpl for vtable {:X}.", vtableAddress);
+        return true;
+    }
 
     bool InstallArrowProjectileUpdateHook(RE::ArrowProjectile* arrow)
     {
@@ -147,12 +176,45 @@ namespace
         if (original) {
             original(arrow, delta);
         }
-        const auto& projectileData = arrow->GetProjectileRuntimeData();
-        const auto* projectile3D = arrow->Get3D();
-        const auto position = projectile3D
-            ? projectile3D->world.translate
-            : projectileData.unk0A8.translate;
-        TrajectoryRenderer::RecordActualProjectilePosition(arrow, position);
+        if (TrajectoryRenderer::IsActualTraceVisible()) {
+            const auto& projectileData = arrow->GetProjectileRuntimeData();
+            const auto* projectile3D = arrow->Get3D();
+            const auto position = projectile3D
+                ? projectile3D->world.translate
+                : projectileData.unk0A8.translate;
+            TrajectoryRenderer::RecordActualProjectilePosition(arrow, position);
+        }
+    }
+
+    void SpellProjectileUpdateImplHook(RE::Projectile* projectile, float delta)
+    {
+        if (!projectile) {
+            return;
+        }
+
+        const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(projectile);
+        SpellProjectileUpdateImpl original = nullptr;
+        {
+            std::scoped_lock lock(g_spellProjectileUpdateImplMutex);
+            const auto found = g_originalSpellProjectileUpdateImpls.find(vtableAddress);
+            if (found != g_originalSpellProjectileUpdateImpls.end()) {
+                original = found->second;
+            }
+        }
+        if (original) {
+            original(projectile, delta);
+        }
+        // Match the mounted-arrow correction: let Skyrim update the missile,
+        // then restore the guide-aligned velocity after its own aim adjustment.
+        TrajectoryPrediction::ApplyPendingMountedSpellVelocity(projectile);
+        if (TrajectoryRenderer::IsActualTraceVisible()) {
+            const auto& projectileData = projectile->GetProjectileRuntimeData();
+            const auto* projectile3D = projectile->Get3D();
+            const auto position = projectile3D
+                ? projectile3D->world.translate
+                : projectileData.unk0A8.translate;
+            TrajectoryRenderer::RecordActualProjectilePosition(projectile, position);
+        }
     }
 
     void ArrowFlightPathUpdateHook(RE::Projectile* projectile)
@@ -172,9 +234,23 @@ namespace
         RE::Projectile::LaunchData& launchData) noexcept
     {
         TrajectoryPrediction::CorrectMountedArrowLaunchData(launchData);
-        return g_originalProjectileLaunch
-            ? g_originalProjectileLaunch(result, launchData)
-            : nullptr;
+        const bool correctedMountedSpell = Trajectory::CorrectMountedSpellLaunchData(launchData);
+        if (!g_originalProjectileLaunch) {
+            return nullptr;
+        }
+
+        auto* launchedHandle = g_originalProjectileLaunch(result, launchData);
+        if (correctedMountedSpell && launchedHandle) {
+            auto launchedProjectile = launchedHandle->get();
+            auto* projectile = launchedProjectile.get();
+            if (projectile && TrajectoryPrediction::CorrectMountedSpellProjectileVelocity(projectile, launchData)) {
+                InstallMountedSpellProjectileUpdateHook(projectile);
+                if (TrajectoryRenderer::IsActualTraceVisible()) {
+                    TrajectoryRenderer::BeginActualProjectileTrace(projectile, &launchData.origin);
+                }
+            }
+        }
+        return launchedHandle;
     }
 
     void HUDAdvanceMovieHook(RE::HUDMenu* menu, float interval, std::uint32_t currentTime)

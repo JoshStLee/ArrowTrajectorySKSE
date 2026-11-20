@@ -5,6 +5,7 @@
 		}
 	],
 	"settings": {
-		"opencode.supervisor.enabled": false
+		"opencode.supervisor.enabled": false,
+		"CodeGPT.apiKey": "CodeGPT Plus Beta"
 	}
 }

@@ -38,5 +38,9 @@ namespace TrajectoryPrediction
 
     void CorrectPlayerArrowVelocity(RE::ArrowProjectile* arrow);
     void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow);
+    bool CorrectMountedSpellProjectileVelocity(
+        RE::Projectile* projectile,
+        const RE::Projectile::LaunchData& launchData);
+    void ApplyPendingMountedSpellVelocity(RE::Projectile* projectile);
     bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData);
 }

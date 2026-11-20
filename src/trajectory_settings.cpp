@@ -79,7 +79,7 @@ namespace
         }
 
         auto visible = TrajectoryRenderer::IsActualTraceVisible();
-        if (g_checkbox("Show cyan arrow trace", &visible)) {
+        if (g_checkbox("Show cyan projectile trace", &visible)) {
             TrajectoryRenderer::SetActualTraceVisible(visible);
             SaveTraceVisibility(visible);
         }
