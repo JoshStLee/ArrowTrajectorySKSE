@@ -4,6 +4,7 @@
 
 namespace RE
 {
+    class IMenu;
     class NiCamera;
     class NiPoint3;
     class Projectile;
@@ -14,15 +15,19 @@ namespace TrajectoryRenderer
     void SetActualTraceVisible(bool visible);
     bool IsActualTraceVisible();
     bool Install();
-    void Submit(
+    bool Submit(
         const std::vector<RE::NiPoint3>& path,
+        RE::IMenu* menu,
         RE::NiCamera* camera,
-        const RE::NiPoint3* cursor = nullptr);
+        const RE::NiPoint3* cursor = nullptr,
+        RE::NiPoint3* cursorHUDPosition = nullptr);
     void BeginActualProjectileTrace(
         const RE::Projectile* projectile,
         const RE::NiPoint3* initialPosition = nullptr);
-    void RecordActualProjectilePosition(
+    bool IsTracingProjectile(const RE::Projectile* projectile);
+    bool RecordActualProjectilePosition(
         const RE::Projectile* projectile,
         const RE::NiPoint3& position);
+    void EndActualProjectileTrace(const RE::Projectile* projectile);
     void Clear();
 }

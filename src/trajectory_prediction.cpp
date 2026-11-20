@@ -7,7 +7,6 @@
 #include <deque>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace TrajectoryPrediction
@@ -57,17 +56,25 @@ namespace
     struct PendingMountedArrowLaunch
     {
         RE::NiPoint3 velocity;
+        RE::ProjectileHandle handle;
     };
 
     struct PendingMountedSpellLaunch
     {
         RE::NiPoint3 velocity;
+        RE::ProjectileHandle handle;
     };
 
-    std::unordered_set<std::uintptr_t> g_correctedMountedArrows;
+    using ProjectileHandleValue = RE::ProjectileHandle::native_handle_type;
+
+    // Address keys keep the hot lookup cheap; handle generations distinguish a
+    // new projectile when Skyrim reuses an object's memory address.
+    std::unordered_map<std::uintptr_t, ProjectileHandleValue> g_correctedMountedArrows;
     std::deque<std::uintptr_t> g_recentMountedArrows;
     std::unordered_map<std::uintptr_t, PendingMountedArrowLaunch> g_pendingMountedArrowLaunches;
+    std::deque<std::uintptr_t> g_recentPendingMountedArrows;
     std::unordered_map<std::uintptr_t, PendingMountedSpellLaunch> g_pendingMountedSpellLaunches;
+    std::deque<std::uintptr_t> g_recentPendingMountedSpells;
     std::optional<PreviewLaunchData> g_lastMountedPreview;
 
     struct BowDrawTimerEntry
@@ -75,6 +82,9 @@ namespace
         float drawTime;
         float unknown[3];
     };
+
+    RE::Setting* GetBowTiltSetting();
+
     PhysicsVector ToVector(const RE::NiPoint3& point)
     {
         return { point.x, point.y, point.z };
@@ -94,24 +104,76 @@ namespace
         };
     }
 
-    bool WasMountedArrowCorrected(const RE::ArrowProjectile* arrow)
+    bool WasMountedArrowCorrected(RE::ArrowProjectile* arrow)
     {
         const auto address = reinterpret_cast<std::uintptr_t>(arrow);
-        return g_correctedMountedArrows.contains(address);
+        const auto found = g_correctedMountedArrows.find(address);
+        if (found == g_correctedMountedArrows.end()) {
+            return false;
+        }
+
+        const auto handle = RE::ProjectileHandle(arrow).native_handle();
+        if (found->second == handle) {
+            return true;
+        }
+
+        g_correctedMountedArrows.erase(found);
+        std::erase(g_recentMountedArrows, address);
+        return false;
     }
 
-    void RememberMountedArrowCorrected(const RE::ArrowProjectile* arrow)
+    void RememberMountedArrowCorrected(RE::ArrowProjectile* arrow)
     {
         const auto address = reinterpret_cast<std::uintptr_t>(arrow);
-        if (!g_correctedMountedArrows.insert(address).second) {
-            return;
-        }
+        const auto handle = RE::ProjectileHandle(arrow).native_handle();
+        g_correctedMountedArrows.insert_or_assign(address, handle);
+        std::erase(g_recentMountedArrows, address);
         g_recentMountedArrows.push_back(address);
         constexpr std::size_t kTrackedMountedArrows = 256;
         if (g_recentMountedArrows.size() > kTrackedMountedArrows) {
             g_correctedMountedArrows.erase(g_recentMountedArrows.front());
             g_recentMountedArrows.pop_front();
         }
+    }
+
+    template <class Pending>
+    void StorePendingMountedLaunch(
+        std::unordered_map<std::uintptr_t, Pending>& pendingLaunches,
+        std::deque<std::uintptr_t>& recentLaunches,
+        std::uintptr_t address,
+        Pending pending)
+    {
+        for (auto it = pendingLaunches.begin(); it != pendingLaunches.end();) {
+            if (!static_cast<bool>(it->second.handle.get())) {
+                const auto expiredAddress = it->first;
+                it = pendingLaunches.erase(it);
+                std::erase(recentLaunches, expiredAddress);
+            } else {
+                ++it;
+            }
+        }
+
+        if (!pendingLaunches.contains(address)) {
+            recentLaunches.push_back(address);
+        }
+        pendingLaunches.insert_or_assign(address, pending);
+        // A projectile can be destroyed before its first update hook consumes
+        // the entry, so bound this queue as a fallback cleanup path.
+        constexpr std::size_t kMaxPendingMountedLaunches = 64;
+        while (recentLaunches.size() > kMaxPendingMountedLaunches) {
+            pendingLaunches.erase(recentLaunches.front());
+            recentLaunches.pop_front();
+        }
+    }
+
+    template <class Pending>
+    void ErasePendingMountedLaunch(
+        std::unordered_map<std::uintptr_t, Pending>& pendingLaunches,
+        std::deque<std::uintptr_t>& recentLaunches,
+        std::uintptr_t address)
+    {
+        pendingLaunches.erase(address);
+        std::erase(recentLaunches, address);
     }
 
     void CorrectPlayerArrowVelocityInternal(RE::ArrowProjectile* arrow)
@@ -154,7 +216,7 @@ namespace
             aim.yaw = arrow->GetAngleZ();
         } else {
             float tilt = 2.5f;
-            if (const auto* setting = RE::INISettingCollection::GetSingleton()->GetSetting("f3PArrowTiltUpAngle:Combat")) {
+            if (const auto* setting = GetBowTiltSetting()) {
                 tilt = setting->GetFloat();
             }
             aim.pitch -= tilt * 0.017453292519943295f;
@@ -183,9 +245,13 @@ namespace
             // Queue it for the movement hook too: Skyrim can rebuild projectile
             // velocity after UpdateArrowFlightPath and before its first step.
             projectileData.linearVelocity = g_lastMountedPreview->velocity;
-            g_pendingMountedArrowLaunches.insert_or_assign(
-                reinterpret_cast<std::uintptr_t>(arrow),
-                PendingMountedArrowLaunch{ g_lastMountedPreview->velocity });
+            const auto address = reinterpret_cast<std::uintptr_t>(arrow);
+            const auto handle = RE::ProjectileHandle(arrow);
+            StorePendingMountedLaunch(
+                g_pendingMountedArrowLaunches,
+                g_recentPendingMountedArrows,
+                address,
+                PendingMountedArrowLaunch{ g_lastMountedPreview->velocity, handle });
         } else {
             const auto pitchCos = std::cos(aim.pitch);
             projectileData.linearVelocity = {
@@ -272,6 +338,15 @@ namespace
         return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
     }
 
+    RE::Setting* GetBowTiltSetting()
+    {
+        static auto* setting = [] {
+            const auto collection = RE::INISettingCollection::GetSingleton();
+            return collection ? collection->GetSetting("f3PArrowTiltUpAngle:Combat") : nullptr;
+        }();
+        return setting;
+    }
+
     float Length(const PhysicsVector& value)
     {
         return std::sqrt(Dot(value, value));
@@ -283,15 +358,33 @@ namespace
         return length > 0.0001f ? value * (1.0f / length) : PhysicsVector{};
     }
 
+    struct RaycastContext
+    {
+        RE::bhkWorld* world{};
+        const RE::NiAVObject* player3D{};
+        RE::NiPointer<RE::Actor> mount;
+        const RE::NiAVObject* mount3D{};
+    };
+
+    RaycastContext MakeRaycastContext(RE::PlayerCharacter* player, const RE::NiAVObject* player3D)
+    {
+        RaycastContext context;
+        const auto cell = player->GetParentCell();
+        context.world = cell ? cell->GetbhkWorld() : nullptr;
+        context.player3D = player3D;
+        if (player->IsOnMount() && player->GetMount(context.mount) && context.mount) {
+            context.mount3D = context.mount->Get3D();
+        }
+        return context;
+    }
+
     std::optional<PhysicsVector> CastRayVector(
-        RE::PlayerCharacter* player,
+        const RaycastContext& context,
         const PhysicsVector& start,
         const PhysicsVector& end,
         std::uint64_t collisionMask = kSmoothCamCollisionMask)
     {
-        const auto cell = player->GetParentCell();
-        const auto world = cell ? cell->GetbhkWorld() : nullptr;
-        if (!world) {
+        if (!context.world) {
             return std::nullopt;
         }
 
@@ -303,23 +396,25 @@ namespace
         pickData.rayInput.to = RE::hkVector4(0.0f, 0.0f, 0.0f, 0.0f);
         pickData.ray = RE::hkVector4(delta.x * scale, delta.y * scale, delta.z * scale, 1.0f);
 
-        const auto player3D = player->Get3D();
-        const RE::NiAVObject* mount3D = nullptr;
-        if (player->IsOnMount()) {
-            RE::NiPointer<RE::Actor> mount;
-            if (player->GetMount(mount) && mount) {
-                mount3D = mount->Get3D();
-            }
-        }
-        FirstHitCollector collector(player3D, mount3D, collisionMask);
+        FirstHitCollector collector(context.player3D, context.mount3D, collisionMask);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
-        world->PickObject(pickData);
+        context.world->PickObject(pickData);
 
         if (!collector.hasHit) {
             return std::nullopt;
         }
         return start + delta * collector.closestHitFraction;
+    }
+
+    std::optional<PhysicsVector> CastRayVector(
+        RE::PlayerCharacter* player,
+        const PhysicsVector& start,
+        const PhysicsVector& end,
+        std::uint64_t collisionMask = kSmoothCamCollisionMask)
+    {
+        const auto context = MakeRaycastContext(player, player->Get3D());
+        return CastRayVector(context, start, end, collisionMask);
     }
 
     float GetBowDrawStrength(const RE::PlayerCharacter* player)
@@ -334,9 +429,12 @@ namespace
         if (!std::isfinite(drawTime)) {
             return 1.0f;
         }
-        const auto minDrawTime = *REL::Relocation<float*>{ REL::RelocationID(505070, 374232) };
-        const auto minPower = *REL::Relocation<float*>{ REL::RelocationID(505072, 374235) };
-        const auto remapped = ((drawTime - minDrawTime) / (1.0f - minDrawTime)) * (1.0f - minPower) + minPower;
+        static const REL::Relocation<float*> minDrawTime{ REL::RelocationID(505070, 374232) };
+        static const REL::Relocation<float*> minPower{ REL::RelocationID(505072, 374235) };
+        const auto minDrawTimeValue = *minDrawTime;
+        const auto minPowerValue = *minPower;
+        const auto remapped = ((drawTime - minDrawTimeValue) / (1.0f - minDrawTimeValue)) *
+            (1.0f - minPowerValue) + minPowerValue;
         return std::clamp(remapped, kMinBowPower, 1.0f);
     }
 
@@ -347,6 +445,18 @@ namespace
             return nullptr;
         }
 
+        struct CachedNodes
+        {
+            const RE::NiAVObject* root{};
+            RE::NiAVObject* weapon{};
+            RE::NiAVObject* rightMagazine{};
+            RE::NiAVObject* leftMagazine{};
+        };
+        static CachedNodes cachedNodes;
+        if (cachedNodes.root != root) {
+            cachedNodes = { root };
+        }
+
         // Match Crosshair::Manager::FindArrowNode in SmoothCam. In particular,
         // a drawn bow's arrow origin is the WEAPON hand node, while crossbows
         // and fallback rigs use their magazine nodes.
@@ -354,6 +464,12 @@ namespace
         static const RE::BSFixedString arrowName("Arrow:0");
         static const RE::BSFixedString rightMagazineName("NPC R MagicNode [RMag]");
         static const RE::BSFixedString leftMagazineName("NPC L MagicNode [LMag]");
+        const auto getCachedNode = [root](RE::NiAVObject*& cached, const RE::BSFixedString& name) {
+            if (!cached) {
+                cached = root->GetObjectByName(name);
+            }
+            return cached;
+        };
 
         const auto rightWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(false));
         const auto leftWeapon = skyrim_cast<const RE::TESObjectWEAP*>(actor->GetEquippedObject(true));
@@ -361,7 +477,7 @@ namespace
             return weapon && weapon->weaponData.animationType == RE::WEAPON_TYPE::kCrossbow;
         };
         if (isCrossbow(rightWeapon) || isCrossbow(leftWeapon)) {
-            if (auto* magazine = root->GetObjectByName(rightMagazineName)) {
+            if (auto* magazine = getCachedNode(cachedNodes.rightMagazine, rightMagazineName)) {
                 if (auto* arrow = magazine->GetObjectByName(arrowName)) {
                     return arrow;
                 }
@@ -369,19 +485,19 @@ namespace
             }
         }
 
-        auto* handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(weaponName));
+        auto* handNode = skyrim_cast<RE::NiNode*>(getCachedNode(cachedNodes.weapon, weaponName));
         if (handNode && handNode->children.size() > 0 && handNode->GetObjectByName(arrowName)) {
             return handNode;
         }
 
-        handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(rightMagazineName));
+        handNode = skyrim_cast<RE::NiNode*>(getCachedNode(cachedNodes.rightMagazine, rightMagazineName));
         if (handNode && handNode->children.size() > 0) {
             if (auto* arrow = handNode->GetObjectByName(arrowName)) {
                 return arrow;
             }
         }
 
-        handNode = skyrim_cast<RE::NiNode*>(root->GetObjectByName(leftMagazineName));
+        handNode = skyrim_cast<RE::NiNode*>(getCachedNode(cachedNodes.leftMagazine, leftMagazineName));
         if (handNode && handNode->children.size() > 0) {
             if (auto* arrow = handNode->GetObjectByName(arrowName)) {
                 return arrow;
@@ -421,7 +537,7 @@ namespace
             aim.yaw = player->GetAngleZ();
         }
         float tiltRadians = 0.0f;
-        if (const auto* setting = RE::INISettingCollection::GetSingleton()->GetSetting("f3PArrowTiltUpAngle:Combat")) {
+        if (const auto* setting = GetBowTiltSetting()) {
             tiltRadians = setting->GetFloat() * 0.017453292519943295f;
         }
         const auto arrowNode = FindArrowNode(player);
@@ -434,6 +550,7 @@ namespace
             failureReason = "player 3D is unavailable";
             return false;
         }
+        const auto raycastContext = MakeRaycastContext(player, player3D);
         // Match SmoothCam's Crosshair::Manager::TranslateFirePostion: rotate
         // the arrow's actor-local offset for ordinary third person aiming.
         // Horse camera keeps the node's world position unchanged.
@@ -472,28 +589,34 @@ namespace
         if (const auto weapon = skyrim_cast<const RE::TESObjectWEAP*>(player->GetEquippedObject(false))) {
             weaponSpeed = weapon->weaponData.speed;
         }
-        const auto speedUpperLimit = *REL::Relocation<float*>{ REL::RelocationID(505064, 374223) };
-        const auto speedLowerLimit = *REL::Relocation<float*>{ REL::RelocationID(505066, 374226) };
-        const auto speedMultiplier = *REL::Relocation<float*>{ REL::RelocationID(515530, 401668) };
-        if (speedUpperLimit <= weaponSpeed) {
-            weaponSpeed = speedUpperLimit;
+        static const REL::Relocation<float*> speedUpperLimit{ REL::RelocationID(505064, 374223) };
+        static const REL::Relocation<float*> speedLowerLimit{ REL::RelocationID(505066, 374226) };
+        static const REL::Relocation<float*> speedMultiplier{ REL::RelocationID(515530, 401668) };
+        const auto speedUpperLimitValue = *speedUpperLimit;
+        const auto speedLowerLimitValue = *speedLowerLimit;
+        const auto speedMultiplierValue = *speedMultiplier;
+        if (speedUpperLimitValue <= weaponSpeed) {
+            weaponSpeed = speedUpperLimitValue;
         }
-        if (weaponSpeed <= speedLowerLimit) {
-            weaponSpeed = speedLowerLimit;
+        if (weaponSpeed <= speedLowerLimitValue) {
+            weaponSpeed = speedLowerLimitValue;
         }
-        const auto weaponSpeedMultiplier = (speedLowerLimit - weaponSpeed) * speedMultiplier + 1.0f;
+        const auto weaponSpeedMultiplier =
+            (speedLowerLimitValue - weaponSpeed) * speedMultiplierValue + 1.0f;
         auto velocity = direction * (projectile->data.speed * drawStrength * weaponSpeedMultiplier);
         if (player->IsOnMount()) {
             g_lastMountedPreview = PreviewLaunchData{ start, ToNi(velocity), aim };
         }
 
         auto worldGravity = PhysicsVector{ 0.0f, 0.0f, -9.8f };
-        if (const auto cell = player->GetParentCell(); cell && cell->GetbhkWorld() && cell->GetbhkWorld()->GetWorld1()) {
-            const auto& gravity = cell->GetbhkWorld()->GetWorld1()->gravity.quad;
+        const auto world = raycastContext.world ? raycastContext.world->GetWorld1() : nullptr;
+        if (world) {
+            const auto& gravity = world->gravity.quad;
             worldGravity = { gravity.m128_f32[0], gravity.m128_f32[1], gravity.m128_f32[2] };
         }
         const auto gravity = worldGravity * (projectile->data.gravity * kGravityScale);
-        auto position = ToVector(start);
+        const auto startPosition = ToVector(start);
+        auto position = startPosition;
         auto previous = position;
         path.clear();
         path.reserve(kMaxSegments + 1);
@@ -506,7 +629,7 @@ namespace
             position += velocity * kStep;
 
             if (const auto hit = CastRayVector(
-                    player,
+                    raycastContext,
                     previous,
                     position,
                     kArrowPredictionCollisionMask)) {
@@ -517,7 +640,8 @@ namespace
 
             path.push_back(ToNi(position));
             previous = position;
-            if (Length(position - ToVector(start)) >= kMaxRange) {
+            const auto offsetFromStart = position - startPosition;
+            if (Dot(offsetFromStart, offsetFromStart) >= kMaxRange * kMaxRange) {
                 break;
             }
         }
@@ -572,8 +696,20 @@ void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow)
         return;
     }
 
-    const auto pending = g_pendingMountedArrowLaunches.find(reinterpret_cast<std::uintptr_t>(arrow));
+    const auto player = RE::PlayerCharacter::GetSingleton();
+    const auto& projectileData = arrow->GetProjectileRuntimeData();
+    if (!player || !projectileData.shooter || projectileData.shooter.get().get() != player) {
+        return;
+    }
+
+    const auto address = reinterpret_cast<std::uintptr_t>(arrow);
+    const auto pending = g_pendingMountedArrowLaunches.find(address);
     if (pending == g_pendingMountedArrowLaunches.end()) {
+        return;
+    }
+    const auto handle = RE::ProjectileHandle(arrow);
+    if (pending->second.handle != handle) {
+        ErasePendingMountedLaunch(g_pendingMountedArrowLaunches, g_recentPendingMountedArrows, address);
         return;
     }
 
@@ -586,7 +722,7 @@ void ApplyPendingMountedArrowVelocity(RE::ArrowProjectile* arrow)
     angle.x = arrowPitch;
     angle.z = arrowYaw;
     arrow->SetAngle(angle);
-    g_pendingMountedArrowLaunches.erase(pending);
+    ErasePendingMountedLaunch(g_pendingMountedArrowLaunches, g_recentPendingMountedArrows, address);
 }
 
 bool CorrectMountedSpellProjectileVelocity(
@@ -623,9 +759,13 @@ bool CorrectMountedSpellProjectileVelocity(
 
     const auto velocity = direction * speed;
     projectileData.linearVelocity = velocity;
-    g_pendingMountedSpellLaunches.insert_or_assign(
-        reinterpret_cast<std::uintptr_t>(projectile),
-        PendingMountedSpellLaunch{ velocity });
+    const auto address = reinterpret_cast<std::uintptr_t>(projectile);
+    const auto handle = RE::ProjectileHandle(projectile);
+    StorePendingMountedLaunch(
+        g_pendingMountedSpellLaunches,
+        g_recentPendingMountedSpells,
+        address,
+        PendingMountedSpellLaunch{ velocity, handle });
     return true;
 }
 
@@ -635,13 +775,25 @@ void ApplyPendingMountedSpellVelocity(RE::Projectile* projectile)
         return;
     }
 
-    const auto pending = g_pendingMountedSpellLaunches.find(reinterpret_cast<std::uintptr_t>(projectile));
+    const auto player = RE::PlayerCharacter::GetSingleton();
+    const auto& projectileData = projectile->GetProjectileRuntimeData();
+    if (!player || !projectileData.shooter || projectileData.shooter.get().get() != player) {
+        return;
+    }
+
+    const auto address = reinterpret_cast<std::uintptr_t>(projectile);
+    const auto pending = g_pendingMountedSpellLaunches.find(address);
     if (pending == g_pendingMountedSpellLaunches.end()) {
+        return;
+    }
+    const auto handle = RE::ProjectileHandle(projectile);
+    if (pending->second.handle != handle) {
+        ErasePendingMountedLaunch(g_pendingMountedSpellLaunches, g_recentPendingMountedSpells, address);
         return;
     }
 
     projectile->GetProjectileRuntimeData().linearVelocity = pending->second.velocity;
-    g_pendingMountedSpellLaunches.erase(pending);
+    ErasePendingMountedLaunch(g_pendingMountedSpellLaunches, g_recentPendingMountedSpells, address);
 }
 
 bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData)

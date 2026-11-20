@@ -164,25 +164,33 @@ namespace
         }
 
         const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(arrow);
-        ArrowUpdateImpl original = nullptr;
-        {
+        static thread_local std::uintptr_t cachedVtableAddress = 0;
+        static thread_local ArrowUpdateImpl cachedOriginal = nullptr;
+        if (cachedVtableAddress != vtableAddress) {
             std::scoped_lock lock(g_arrowUpdateImplMutex);
             const auto found = g_originalArrowUpdateImpls.find(vtableAddress);
             if (found != g_originalArrowUpdateImpls.end()) {
-                original = found->second;
+                cachedVtableAddress = vtableAddress;
+                cachedOriginal = found->second;
+            } else {
+                cachedVtableAddress = 0;
+                cachedOriginal = nullptr;
             }
         }
         TrajectoryPrediction::ApplyPendingMountedArrowVelocity(arrow);
-        if (original) {
-            original(arrow, delta);
+        if (cachedOriginal) {
+            cachedOriginal(arrow, delta);
         }
-        if (TrajectoryRenderer::IsActualTraceVisible()) {
+        if (TrajectoryRenderer::IsTracingProjectile(arrow)) {
             const auto& projectileData = arrow->GetProjectileRuntimeData();
             const auto* projectile3D = arrow->Get3D();
             const auto position = projectile3D
                 ? projectile3D->world.translate
                 : projectileData.unk0A8.translate;
-            TrajectoryRenderer::RecordActualProjectilePosition(arrow, position);
+            const auto traced = TrajectoryRenderer::RecordActualProjectilePosition(arrow, position);
+            if (traced && arrow->IsMarkedForDeletion()) {
+                TrajectoryRenderer::EndActualProjectileTrace(arrow);
+            }
         }
     }
 
@@ -193,27 +201,35 @@ namespace
         }
 
         const auto vtableAddress = *reinterpret_cast<std::uintptr_t*>(projectile);
-        SpellProjectileUpdateImpl original = nullptr;
-        {
+        static thread_local std::uintptr_t cachedVtableAddress = 0;
+        static thread_local SpellProjectileUpdateImpl cachedOriginal = nullptr;
+        if (cachedVtableAddress != vtableAddress) {
             std::scoped_lock lock(g_spellProjectileUpdateImplMutex);
             const auto found = g_originalSpellProjectileUpdateImpls.find(vtableAddress);
             if (found != g_originalSpellProjectileUpdateImpls.end()) {
-                original = found->second;
+                cachedVtableAddress = vtableAddress;
+                cachedOriginal = found->second;
+            } else {
+                cachedVtableAddress = 0;
+                cachedOriginal = nullptr;
             }
         }
-        if (original) {
-            original(projectile, delta);
+        if (cachedOriginal) {
+            cachedOriginal(projectile, delta);
         }
         // Match the mounted-arrow correction: let Skyrim update the missile,
         // then restore the guide-aligned velocity after its own aim adjustment.
         TrajectoryPrediction::ApplyPendingMountedSpellVelocity(projectile);
-        if (TrajectoryRenderer::IsActualTraceVisible()) {
+        if (TrajectoryRenderer::IsTracingProjectile(projectile)) {
             const auto& projectileData = projectile->GetProjectileRuntimeData();
             const auto* projectile3D = projectile->Get3D();
             const auto position = projectile3D
                 ? projectile3D->world.translate
                 : projectileData.unk0A8.translate;
-            TrajectoryRenderer::RecordActualProjectilePosition(projectile, position);
+            const auto traced = TrajectoryRenderer::RecordActualProjectilePosition(projectile, position);
+            if (traced && projectile->IsMarkedForDeletion()) {
+                TrajectoryRenderer::EndActualProjectileTrace(projectile);
+            }
         }
     }
 

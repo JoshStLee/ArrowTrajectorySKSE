@@ -19,9 +19,20 @@ namespace
     bool g_reportedPredictionHit = false;
     bool g_reportedMagicRayResult = false;
     bool g_reportedNoAmmo = false;
+    bool g_guidanceWasActive = false;
 
     std::mutex g_mountedSpellPreviewMutex;
     std::optional<RE::NiPoint3> g_mountedSpellTarget;
+
+    struct AimNodeCache
+    {
+        const RE::NiAVObject* root{};
+        RE::NiAVObject* headMagic{};
+        RE::NiAVObject* rightHand{};
+        RE::NiAVObject* rightHandFallback{};
+    };
+
+    AimNodeCache g_aimNodeCache;
 
     void SetMountedSpellTarget(std::optional<RE::NiPoint3> target)
     {
@@ -157,18 +168,30 @@ namespace
         const auto player3D = player->Get3D();
         static const RE::BSFixedString headMagicNodeName("NPC Head MagicNode [Hmag]");
         if (player3D) {
+            if (g_aimNodeCache.root != player3D) {
+                g_aimNodeCache = { player3D };
+            }
             const RE::NiAVObject* magicNode = nullptr;
             if (player->IsOnMount() && useMountedSpellOrigin) {
                 static const RE::BSFixedString rightHandNodeName("NPC R Hand [RHnd]");
                 static const RE::BSFixedString rightHandNodeFallbackName("NPC R Hand");
-                magicNode = player3D->GetObjectByName(rightHandNodeName);
+                if (!g_aimNodeCache.rightHand) {
+                    g_aimNodeCache.rightHand = player3D->GetObjectByName(rightHandNodeName);
+                }
+                magicNode = g_aimNodeCache.rightHand;
                 if (!magicNode) {
-                    magicNode = player3D->GetObjectByName(rightHandNodeFallbackName);
+                    if (!g_aimNodeCache.rightHandFallback) {
+                        g_aimNodeCache.rightHandFallback = player3D->GetObjectByName(rightHandNodeFallbackName);
+                    }
+                    magicNode = g_aimNodeCache.rightHandFallback;
                 }
                 mountedHandOrigin = magicNode != nullptr;
             }
             if (!magicNode) {
-                magicNode = player3D->GetObjectByName(headMagicNodeName);
+                if (!g_aimNodeCache.headMagic) {
+                    g_aimNodeCache.headMagic = player3D->GetObjectByName(headMagicNodeName);
+                }
+                magicNode = g_aimNodeCache.headMagic;
             }
             if (magicNode) {
                 if (player->IsOnMount()) {
@@ -263,7 +286,11 @@ namespace
             IsSpellCastActive(actor, RE::Actor::SlotTypes::kRightHand);
     }
 
-    void DrawCameraGuide(RE::PlayerCharacter* player, RE::NiCamera* camera, bool includeLine)
+    void DrawCameraGuide(
+        RE::PlayerCharacter* player,
+        RE::IMenu* menu,
+        RE::NiCamera* camera,
+        bool includeLine)
     {
         const auto aimRay = GetSharedAimRay(player, RE::PlayerCamera::GetSingleton(), camera);
         const auto& direction = aimRay.direction;
@@ -278,11 +305,13 @@ namespace
             cursor = *result;
         }
 
-        std::vector<RE::NiPoint3> path;
+        static thread_local std::vector<RE::NiPoint3> path;
+        path.clear();
         if (includeLine) {
-            path = { origin, cursor };
+            path.push_back(origin);
+            path.push_back(cursor);
         }
-        TrajectoryRenderer::Submit(path, camera, &cursor);
+        TrajectoryRenderer::Submit(path, menu, camera, &cursor);
     }
 
 }
@@ -327,7 +356,17 @@ bool Trajectory::CorrectMountedSpellLaunchData(RE::Projectile::LaunchData& launc
 void Trajectory::Update(RE::PlayerCamera* camera)
 {
     if (!camera || !RE::PlayerCharacter::GetSingleton()) {
-        SetMountedSpellTarget(std::nullopt);
+        if (g_guidanceWasActive) {
+            SetMountedSpellTarget(std::nullopt);
+        }
+        TrajectoryRenderer::Clear();
+        if (g_guidanceWasActive) {
+            const auto menu = TrajectoryHUD::GetMenu();
+            if (TrajectoryHUD::EnsureState(menu)) {
+                TrajectoryHUD::Reset(menu);
+                g_guidanceWasActive = false;
+            }
+        }
         return;
     }
 
@@ -335,12 +374,15 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     // camera that Skyrim did not update this frame; put the crosshair back instead.
     const auto ui = RE::UI::GetSingleton();
     if (!ui || ui->GameIsPaused()) {
-        SetMountedSpellTarget(std::nullopt);
-        if (auto* pausedMenu = TrajectoryHUD::GetMenu(); pausedMenu && TrajectoryHUD::EnsureState(pausedMenu)) {
-            TrajectoryRenderer::Clear();
-            TrajectoryHUD::Reset(pausedMenu);
-        } else {
-            TrajectoryRenderer::Clear();
+        if (g_guidanceWasActive) {
+            SetMountedSpellTarget(std::nullopt);
+        }
+        TrajectoryRenderer::Clear();
+        if (g_guidanceWasActive) {
+            if (auto* pausedMenu = TrajectoryHUD::GetMenu(); pausedMenu && TrajectoryHUD::EnsureState(pausedMenu)) {
+                TrajectoryHUD::Reset(pausedMenu);
+                g_guidanceWasActive = false;
+            }
         }
         return;
     }
@@ -348,7 +390,9 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     const auto player = RE::PlayerCharacter::GetSingleton();
     auto* menu = TrajectoryHUD::GetMenu();
     if (!TrajectoryHUD::EnsureState(menu)) {
-        SetMountedSpellTarget(std::nullopt);
+        if (g_guidanceWasActive) {
+            SetMountedSpellTarget(std::nullopt);
+        }
         TrajectoryRenderer::Clear();
         static bool reportedHUDUnavailable = false;
         if (!reportedHUDUnavailable) {
@@ -360,18 +404,37 @@ void Trajectory::Update(RE::PlayerCamera* camera)
 
     const bool usingMagic = HasCombatMagicReadied(player);
     const bool usingBow = !usingMagic && IsBowOrCrossbowReadied(player);
+
+    if (!usingMagic && !usingBow) {
+        if (g_guidanceWasActive) {
+            SetMountedSpellTarget(std::nullopt);
+        }
+        TrajectoryRenderer::Clear();
+        if (g_guidanceWasActive) {
+            TrajectoryHUD::Reset(menu);
+        }
+        g_guidanceWasActive = false;
+        return;
+    }
+
     if (!usingMagic || !player->IsOnMount()) {
         SetMountedSpellTarget(std::nullopt);
     }
 
     const auto worldCamera = RE::Main::WorldRootCamera();
     if (!worldCamera) {
-        SetMountedSpellTarget(std::nullopt);
+        if (g_guidanceWasActive) {
+            SetMountedSpellTarget(std::nullopt);
+        }
         TrajectoryRenderer::Clear();
-        TrajectoryHUD::Reset(menu);
+        if (g_guidanceWasActive) {
+            TrajectoryHUD::Reset(menu);
+        }
+        g_guidanceWasActive = false;
         return;
     }
 
+    g_guidanceWasActive = true;
     // The HUD dot remains useful with Skyrim's first-person aiming view. In
     // third person, use the world-space trajectory without the misleading dot.
     TrajectoryHUD::SetCrosshairVisible(menu, camera->IsInFirstPerson());
@@ -380,12 +443,13 @@ void Trajectory::Update(RE::PlayerCamera* camera)
     path.clear();
     RE::NiPoint3 hitPosition{};
     bool hit = false;
+    std::optional<RE::NiPoint3> projectedHUDCursor;
     if (usingBow) {
         // At bow-ready idle there is no meaningful arrow velocity yet. Show
         // the camera ray and world dot until the bow attack state starts; only
         // then use the ballistic predictor.
         if (!IsBowStringInUse(player)) {
-            DrawCameraGuide(player, worldCamera, false);
+            DrawCameraGuide(player, menu, worldCamera, false);
             return;
         }
 
@@ -395,7 +459,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
                 logger::warn("Trajectory prediction skipped: no current bow ammo/projectile.");
                 g_reportedNoAmmo = true;
             }
-            DrawCameraGuide(player, worldCamera, true);
+            DrawCameraGuide(player, menu, worldCamera, true);
             return;
         }
         const char* failureReason = nullptr;
@@ -419,9 +483,12 @@ void Trajectory::Update(RE::PlayerCamera* camera)
                 hitPosition = path.back();
             }
             const auto cursor = hitPosition;
-            TrajectoryRenderer::Submit(path, worldCamera, &cursor);
+            RE::NiPoint3 projectedCursor{};
+            if (TrajectoryRenderer::Submit(path, menu, worldCamera, &cursor, &projectedCursor)) {
+                projectedHUDCursor = projectedCursor;
+            }
         } else {
-            DrawCameraGuide(player, worldCamera, path.empty());
+            DrawCameraGuide(player, menu, worldCamera, path.empty());
         }
         if (!hit && failureReason && path.empty() && !g_reportedPredictionFailure) {
             logger::warn("Bow trajectory was not simulated: {}.", failureReason);
@@ -438,7 +505,7 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         const auto aimRay = GetSharedAimRay(player, camera, worldCamera, mountedSpell);
         if (Dot(aimRay.direction, aimRay.direction) <= 0.0001f) {
             SetMountedSpellTarget(std::nullopt);
-            DrawCameraGuide(player, worldCamera, true);
+            DrawCameraGuide(player, menu, worldCamera, true);
             TrajectoryHUD::Center(menu);
             return;
         }
@@ -472,13 +539,19 @@ void Trajectory::Update(RE::PlayerCamera* camera)
         if (IsSpellCastActive(player)) {
             path = { origin, cursor };
         }
-        TrajectoryRenderer::Submit(path, worldCamera, &cursor);
+        RE::NiPoint3 projectedCursor{};
+        if (TrajectoryRenderer::Submit(path, menu, worldCamera, &cursor, &projectedCursor)) {
+            projectedHUDCursor = projectedCursor;
+        }
     } else {
         TrajectoryRenderer::Clear();
     }
 
     if (hit) {
-        if (!TrajectoryHUD::SetCrosshairPosition(menu, hitPosition)) {
+        const auto positioned = projectedHUDCursor
+            ? TrajectoryHUD::SetCrosshairPosition(menu, projectedHUDCursor->x, projectedHUDCursor->y)
+            : TrajectoryHUD::SetCrosshairPosition(menu, hitPosition);
+        if (!positioned) {
             TrajectoryHUD::Center(menu);
         }
     } else {

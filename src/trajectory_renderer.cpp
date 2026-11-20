@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -42,7 +43,9 @@ namespace
     std::vector<ScreenPoint> g_screenPath;
     std::vector<ScreenPoint> g_screenActualPath;
     std::vector<RE::NiPoint3> g_actualWorldPath;
-    const RE::Projectile* g_tracedProjectile = nullptr;
+    std::atomic<const RE::Projectile*> g_tracedProjectile{ nullptr };
+    std::chrono::steady_clock::time_point g_actualTraceExpiresAt{};
+    bool g_actualTraceEnding = false;
     std::optional<ScreenPoint> g_screenCursor;
     std::vector<Vertex> g_vertices;
     RE::BSGraphics::Renderer* g_renderer = nullptr;
@@ -244,6 +247,12 @@ namespace
         std::optional<ScreenPoint> cursor;
         {
             std::scoped_lock lock(g_pathMutex);
+            if (g_actualTraceEnding && std::chrono::steady_clock::now() >= g_actualTraceExpiresAt) {
+                g_tracedProjectile.store(nullptr, std::memory_order_relaxed);
+                g_actualWorldPath.clear();
+                g_screenActualPath.clear();
+                g_actualTraceEnding = false;
+            }
             path.assign(g_screenPath.begin(), g_screenPath.end());
             if (g_actualTraceVisible.load(std::memory_order_relaxed)) {
                 actualPath.assign(g_screenActualPath.begin(), g_screenActualPath.end());
@@ -541,10 +550,12 @@ bool TrajectoryRenderer::Install()
     return true;
 }
 
-void TrajectoryRenderer::Submit(
+bool TrajectoryRenderer::Submit(
     const std::vector<RE::NiPoint3>& path,
+    RE::IMenu* menu,
     RE::NiCamera* camera,
-    const RE::NiPoint3* cursor)
+    const RE::NiPoint3* cursor,
+    RE::NiPoint3* cursorHUDPosition)
 {
     static thread_local std::vector<ScreenPoint> projected;
     static thread_local std::vector<ScreenPoint> projectedActual;
@@ -560,22 +571,18 @@ void TrajectoryRenderer::Submit(
     projected.clear();
     projectedActual.clear();
     std::optional<ScreenPoint> projectedCursor;
-    if (!camera || (path.size() < 2 && !cursor && actualWorldPath.size() < 2)) {
+    if (cursorHUDPosition) {
+        *cursorHUDPosition = {};
+    }
+    if (!menu || !menu->uiMovie || !camera || (path.size() < 2 && !cursor && actualWorldPath.size() < 2)) {
         Clear();
-        return;
+        return false;
     }
 
     const auto* renderWindow = RE::BSGraphics::Renderer::GetCurrentRenderWindow();
     if (!renderWindow || renderWindow->windowWidth <= 0 || renderWindow->windowHeight <= 0) {
         Clear();
-        return;
-    }
-    const auto ui = RE::UI::GetSingleton();
-    const auto strings = RE::InterfaceStrings::GetSingleton();
-    const auto menu = ui && strings ? ui->GetMenu(strings->hudMenu) : nullptr;
-    if (!menu || !menu->uiMovie) {
-        Clear();
-        return;
+        return false;
     }
     const auto hudRect = menu->uiMovie->GetVisibleFrameRect();
     const RE::NiRect<float> port(hudRect.left, hudRect.right, hudRect.top, hudRect.bottom);
@@ -583,7 +590,7 @@ void TrajectoryRenderer::Submit(
     const auto hudHeight = hudRect.bottom - hudRect.top;
     if (hudWidth <= 0.0f || hudHeight <= 0.0f) {
         Clear();
-        return;
+        return false;
     }
     const auto scaleX = static_cast<float>(renderWindow->windowWidth) / hudWidth;
     const auto scaleY = static_cast<float>(renderWindow->windowHeight) / hudHeight;
@@ -640,6 +647,11 @@ void TrajectoryRenderer::Submit(
 
     if (cursor) {
         projectedCursor = project(*cursor);
+        if (projectedCursor && cursorHUDPosition) {
+            cursorHUDPosition->x = projectedCursor->x / scaleX + hudRect.left;
+            cursorHUDPosition->y = projectedCursor->y / scaleY + hudRect.top;
+            cursorHUDPosition->z = projectedCursor->depth;
+        }
         if (projectedCursor && !g_cursorProjectionReported) {
             logger::info(
                 "World-hit cursor projected to screen ({:.1f}, {:.1f}), depth {:.4f}.",
@@ -667,14 +679,15 @@ void TrajectoryRenderer::Submit(
             g_projectionFailureReported = true;
         }
         Clear();
-        return;
+        return false;
     }
     {
         std::scoped_lock lock(g_pathMutex);
-        g_screenPath = std::move(projected);
-        g_screenActualPath = std::move(projectedActual);
+        g_screenPath.swap(projected);
+        g_screenActualPath.swap(projectedActual);
         g_screenCursor = projectedCursor;
     }
+    return projectedCursor.has_value();
 }
 
 void TrajectoryRenderer::BeginActualProjectileTrace(
@@ -683,9 +696,10 @@ void TrajectoryRenderer::BeginActualProjectileTrace(
 {
     if (!g_actualTraceVisible.load(std::memory_order_relaxed)) {
         std::scoped_lock lock(g_pathMutex);
-        g_tracedProjectile = nullptr;
+        g_tracedProjectile.store(nullptr, std::memory_order_relaxed);
         g_actualWorldPath.clear();
         g_screenActualPath.clear();
+        g_actualTraceEnding = false;
         return;
     }
 
@@ -702,12 +716,14 @@ void TrajectoryRenderer::BeginActualProjectileTrace(
 
     std::scoped_lock lock(g_pathMutex);
     if (!g_actualTraceVisible.load(std::memory_order_relaxed)) {
-        g_tracedProjectile = nullptr;
+        g_tracedProjectile.store(nullptr, std::memory_order_relaxed);
         g_actualWorldPath.clear();
         g_screenActualPath.clear();
+        g_actualTraceEnding = false;
         return;
     }
-    g_tracedProjectile = projectile;
+    g_tracedProjectile.store(projectile, std::memory_order_relaxed);
+    g_actualTraceEnding = false;
     g_actualWorldPath.clear();
     g_screenActualPath.clear();
     if (position) {
@@ -715,23 +731,33 @@ void TrajectoryRenderer::BeginActualProjectileTrace(
     }
 }
 
-void TrajectoryRenderer::RecordActualProjectilePosition(
+bool TrajectoryRenderer::IsTracingProjectile(const RE::Projectile* projectile)
+{
+    return projectile && g_actualTraceVisible.load(std::memory_order_relaxed) &&
+        g_tracedProjectile.load(std::memory_order_relaxed) == projectile;
+}
+
+bool TrajectoryRenderer::RecordActualProjectilePosition(
     const RE::Projectile* projectile,
     const RE::NiPoint3& position)
 {
     if (!g_actualTraceVisible.load(std::memory_order_relaxed) || !projectile ||
         !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
-        return;
+        return false;
     }
 
     std::scoped_lock lock(g_pathMutex);
-    if (projectile != g_tracedProjectile) {
-        return;
+    if (projectile != g_tracedProjectile.load(std::memory_order_relaxed)) {
+        return false;
     }
 
     constexpr std::size_t kMaxActualTracePoints = 2048;
+    if (g_actualWorldPath.empty()) {
+        g_actualWorldPath.push_back(position);
+        return true;
+    }
     if (g_actualWorldPath.size() >= kMaxActualTracePoints) {
-        return;
+        return true;
     }
     const auto& previous = g_actualWorldPath.back();
     const auto dx = position.x - previous.x;
@@ -740,6 +766,25 @@ void TrajectoryRenderer::RecordActualProjectilePosition(
     if (dx * dx + dy * dy + dz * dz > 0.01f) {
         g_actualWorldPath.push_back(position);
     }
+    return true;
+}
+
+void TrajectoryRenderer::EndActualProjectileTrace(const RE::Projectile* projectile)
+{
+    if (!projectile) {
+        return;
+    }
+
+    std::scoped_lock lock(g_pathMutex);
+    if (projectile != g_tracedProjectile.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    // Keep the completed trace visible briefly so the shot can be inspected,
+    // then release its points and raw projectile identity.
+    g_tracedProjectile.store(nullptr, std::memory_order_relaxed);
+    g_actualTraceExpiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    g_actualTraceEnding = true;
 }
 
 void TrajectoryRenderer::SetActualTraceVisible(bool visible)
@@ -749,9 +794,10 @@ void TrajectoryRenderer::SetActualTraceVisible(bool visible)
         return;
     }
     std::scoped_lock lock(g_pathMutex);
-    g_tracedProjectile = nullptr;
+    g_tracedProjectile.store(nullptr, std::memory_order_relaxed);
     g_actualWorldPath.clear();
     g_screenActualPath.clear();
+    g_actualTraceEnding = false;
 }
 
 bool TrajectoryRenderer::IsActualTraceVisible()

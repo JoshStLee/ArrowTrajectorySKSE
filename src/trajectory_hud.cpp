@@ -121,7 +121,13 @@ bool SetCrosshairPosition(RE::IMenu* menu, const RE::NiPoint3& worldPosition)
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
-    return camera->WorldPtToScreenPt3(worldPosition, x, y, z, 1.0e-5f) && SetScreenPosition(menu, x, y);
+    return camera->WorldPtToScreenPt3(worldPosition, x, y, z, 1.0e-5f) &&
+        SetCrosshairPosition(menu, x, y);
+}
+
+bool SetCrosshairPosition(RE::IMenu* menu, float screenX, float screenY)
+{
+    return SetScreenPosition(menu, screenX, screenY);
 }
 
 void Reset(RE::IMenu* menu)

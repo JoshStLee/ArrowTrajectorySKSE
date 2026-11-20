@@ -13,6 +13,7 @@ namespace TrajectoryHUD
     bool EnsureState(RE::IMenu* menu);
     bool SetCrosshairVisible(RE::IMenu* menu, bool visible);
     bool SetCrosshairPosition(RE::IMenu* menu, const RE::NiPoint3& worldPosition);
+    bool SetCrosshairPosition(RE::IMenu* menu, float screenX, float screenY);
     void Reset(RE::IMenu* menu);
     void Center(RE::IMenu* menu);
 }
