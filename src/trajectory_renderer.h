@@ -11,6 +11,8 @@ namespace RE
 
 namespace TrajectoryRenderer
 {
+    void SetActualTraceVisible(bool visible);
+    bool IsActualTraceVisible();
     bool Install();
     void Submit(
         const std::vector<RE::NiPoint3>& path,

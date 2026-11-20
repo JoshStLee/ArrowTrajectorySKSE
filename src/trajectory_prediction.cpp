@@ -63,7 +63,6 @@ namespace
     std::deque<std::uintptr_t> g_recentMountedArrows;
     std::unordered_map<std::uintptr_t, PendingMountedArrowLaunch> g_pendingMountedArrowLaunches;
     std::optional<PreviewLaunchData> g_lastMountedPreview;
-    bool g_reportedRepeatedMountedArrowUpdate = false;
 
     struct BowDrawTimerEntry
     {
@@ -124,18 +123,8 @@ namespace
         // Mounted aim can move as the horse camera updates. Match the aim at
         // launch once, then let the arrow keep that velocity through flight.
         if (WasMountedArrowCorrected(arrow)) {
-            if (player->IsOnMount() && !g_reportedRepeatedMountedArrowUpdate) {
-                logger::info(
-                    "Mounted arrow flight-path update ran again after correction: arrow=0x{:X}, velocity=({:.1f},{:.1f},{:.1f}).",
-                    reinterpret_cast<std::uintptr_t>(arrow),
-                    projectileData.linearVelocity.x,
-                    projectileData.linearVelocity.y,
-                    projectileData.linearVelocity.z);
-                g_reportedRepeatedMountedArrowUpdate = true;
-            }
             return;
         }
-        const auto nativeVelocity = projectileData.linearVelocity;
 
         const auto playerCamera = RE::PlayerCamera::GetSingleton();
         const auto thirdPersonState = playerCamera
@@ -149,8 +138,6 @@ namespace
         if (thirdPersonState->freeRotationEnabled && !player->IsOnMount()) {
             aim.yaw = player->GetAngleZ();
         }
-        const auto cameraAim = aim;
-
         // Mounted prediction is built from the third-person camera rotation.
         // Keep the released arrow on that same rotation too; using the arrow's
         // animation angles here makes the shot diverge from the mounted guide.
@@ -203,25 +190,6 @@ namespace
         }
 
         if (player->IsOnMount()) {
-            if (g_lastMountedPreview) {
-                logger::info(
-                    "Mounted shot diagnostic: arrow=0x{:X}, nativeVelocity=({:.1f},{:.1f},{:.1f}), correctedVelocity=({:.1f},{:.1f},{:.1f}), correctionAim=(yaw {:.2f}, pitch {:.2f}), previewOrigin=({:.1f},{:.1f},{:.1f}), previewVelocity=({:.1f},{:.1f},{:.1f}), previewAim=(yaw {:.2f}, pitch {:.2f}).",
-                    reinterpret_cast<std::uintptr_t>(arrow),
-                    nativeVelocity.x, nativeVelocity.y, nativeVelocity.z,
-                    projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
-                    cameraAim.yaw * 57.29577951308232f, cameraAim.pitch * 57.29577951308232f,
-                    g_lastMountedPreview->origin.x, g_lastMountedPreview->origin.y, g_lastMountedPreview->origin.z,
-                    g_lastMountedPreview->velocity.x, g_lastMountedPreview->velocity.y, g_lastMountedPreview->velocity.z,
-                    g_lastMountedPreview->aim.yaw * 57.29577951308232f,
-                    g_lastMountedPreview->aim.pitch * 57.29577951308232f);
-            } else {
-                logger::info(
-                    "Mounted shot diagnostic: arrow=0x{:X}, no preview sample, nativeVelocity=({:.1f},{:.1f},{:.1f}), correctedVelocity=({:.1f},{:.1f},{:.1f}), correctionAim=(yaw {:.2f}, pitch {:.2f}).",
-                    reinterpret_cast<std::uintptr_t>(arrow),
-                    nativeVelocity.x, nativeVelocity.y, nativeVelocity.z,
-                    projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
-                    cameraAim.yaw * 57.29577951308232f, cameraAim.pitch * 57.29577951308232f);
-            }
             RememberMountedArrowCorrected(arrow);
             TrajectoryRenderer::BeginActualProjectileTrace(arrow);
         }
@@ -411,6 +379,10 @@ namespace
         PhysicsVector& impact,
         const char*& failureReason)
     {
+        // A preview is frame-local launch state. If this frame cannot produce
+        // one, a later mounted release must fall back instead of reusing an
+        // aim vector from an earlier camera position or riding direction.
+        g_lastMountedPreview.reset();
         failureReason = nullptr;
         const auto ammo = player->GetCurrentAmmo();
         const auto projectile = ammo ? ammo->data.projectile : nullptr;
@@ -608,11 +580,17 @@ bool CorrectMountedArrowLaunchData(RE::Projectile::LaunchData& launchData)
     }
 
     const auto& velocity = g_lastMountedPreview->velocity;
+    const auto& origin = g_lastMountedPreview->origin;
+    if (!std::isfinite(velocity.x) || !std::isfinite(velocity.y) || !std::isfinite(velocity.z) ||
+        !std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) ||
+        std::hypot(velocity.x, velocity.y, velocity.z) <= 0.001f) {
+        return false;
+    }
 
     // Correct the launch parameters before Skyrim creates the projectile.
     // This makes the engine's initial arrow orientation and spawn point use
     // the same aim vector as the mounted trajectory preview in every direction.
-    launchData.origin = g_lastMountedPreview->origin;
+    launchData.origin = origin;
     launchData.angleZ = std::atan2(velocity.x, velocity.y);
     launchData.angleX = -std::atan2(velocity.z, std::hypot(velocity.x, velocity.y));
     launchData.useOrigin = true;

@@ -4,6 +4,7 @@
 #include <REX/W32/D3DCOMPILER.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -37,11 +38,11 @@ namespace
         std::uint32_t);
 
     std::mutex g_pathMutex;
+    std::atomic_bool g_actualTraceVisible{ true };
     std::vector<ScreenPoint> g_screenPath;
     std::vector<ScreenPoint> g_screenActualPath;
     std::vector<RE::NiPoint3> g_actualWorldPath;
     const RE::Projectile* g_tracedProjectile = nullptr;
-    std::size_t g_actualTraceSegmentCount = 0;
     std::optional<ScreenPoint> g_screenCursor;
     std::vector<Vertex> g_vertices;
     RE::BSGraphics::Renderer* g_renderer = nullptr;
@@ -238,13 +239,17 @@ namespace
 
     void DrawSubmittedPath()
     {
-        std::vector<ScreenPoint> path;
-        std::vector<ScreenPoint> actualPath;
+        static thread_local std::vector<ScreenPoint> path;
+        static thread_local std::vector<ScreenPoint> actualPath;
         std::optional<ScreenPoint> cursor;
         {
             std::scoped_lock lock(g_pathMutex);
-            path = g_screenPath;
-            actualPath = g_screenActualPath;
+            path.assign(g_screenPath.begin(), g_screenPath.end());
+            if (g_actualTraceVisible.load(std::memory_order_relaxed)) {
+                actualPath.assign(g_screenActualPath.begin(), g_screenActualPath.end());
+            } else {
+                actualPath.clear();
+            }
             cursor = g_screenCursor;
         }
         if (path.size() < 2 && actualPath.size() < 2 && !cursor) {
@@ -543,10 +548,14 @@ void TrajectoryRenderer::Submit(
 {
     static thread_local std::vector<ScreenPoint> projected;
     static thread_local std::vector<ScreenPoint> projectedActual;
-    std::vector<RE::NiPoint3> actualWorldPath;
+    static thread_local std::vector<RE::NiPoint3> actualWorldPath;
     {
         std::scoped_lock lock(g_pathMutex);
-        actualWorldPath = g_actualWorldPath;
+        if (g_actualTraceVisible.load(std::memory_order_relaxed)) {
+            actualWorldPath.assign(g_actualWorldPath.begin(), g_actualWorldPath.end());
+        } else {
+            actualWorldPath.clear();
+        }
     }
     projected.clear();
     projectedActual.clear();
@@ -671,10 +680,15 @@ void TrajectoryRenderer::Submit(
 void TrajectoryRenderer::BeginActualProjectileTrace(const RE::Projectile* projectile)
 {
     std::scoped_lock lock(g_pathMutex);
+    if (!g_actualTraceVisible.load(std::memory_order_relaxed)) {
+        g_tracedProjectile = nullptr;
+        g_actualWorldPath.clear();
+        g_screenActualPath.clear();
+        return;
+    }
     g_tracedProjectile = projectile;
     g_actualWorldPath.clear();
     g_screenActualPath.clear();
-    g_actualTraceSegmentCount = 0;
     if (projectile) {
         const auto& projectileData = projectile->GetProjectileRuntimeData();
         const auto* projectile3D = projectile->Get3D();
@@ -682,11 +696,6 @@ void TrajectoryRenderer::BeginActualProjectileTrace(const RE::Projectile* projec
             ? projectile3D->world.translate
             : projectileData.unk0A8.translate;
         g_actualWorldPath.push_back(position);
-        logger::info(
-            "Mounted actual projectile position trace started: arrow=0x{:X}, position=({:.1f},{:.1f},{:.1f}), source={}",
-            reinterpret_cast<std::uintptr_t>(projectile),
-            position.x, position.y, position.z,
-            projectile3D ? "3D world transform" : "runtime transform");
     }
 }
 
@@ -694,7 +703,8 @@ void TrajectoryRenderer::RecordActualProjectilePosition(
     const RE::Projectile* projectile,
     const RE::NiPoint3& position)
 {
-    if (!projectile || !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+    if (!g_actualTraceVisible.load(std::memory_order_relaxed) || !projectile ||
+        !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
         return;
     }
 
@@ -703,29 +713,10 @@ void TrajectoryRenderer::RecordActualProjectilePosition(
         return;
     }
 
-    if (g_actualTraceSegmentCount == 0) {
-        const auto& projectileData = projectile->GetProjectileRuntimeData();
-        const auto& previous = g_actualWorldPath.back();
-        const auto* projectile3D = projectile->Get3D();
-        const auto nodePosition = projectile3D
-            ? projectile3D->world.translate
-            : RE::NiPoint3{};
-        const auto runtimePosition = projectileData.unk0A8.translate;
-        const auto referencePosition = projectile->GetPosition();
-        logger::info(
-            "Mounted actual projectile first movement: arrow=0x{:X}, velocity=({:.1f},{:.1f},{:.1f}), start=({:.1f},{:.1f},{:.1f}), sampled=({:.1f},{:.1f},{:.1f}), delta=({:.1f},{:.1f},{:.1f}), node=({:.1f},{:.1f},{:.1f}), runtime=({:.1f},{:.1f},{:.1f}), ref=({:.1f},{:.1f},{:.1f}).",
-            reinterpret_cast<std::uintptr_t>(projectile),
-            projectileData.linearVelocity.x, projectileData.linearVelocity.y, projectileData.linearVelocity.z,
-            previous.x, previous.y, previous.z,
-            position.x, position.y, position.z,
-            position.x - previous.x, position.y - previous.y, position.z - previous.z,
-            nodePosition.x, nodePosition.y, nodePosition.z,
-            runtimePosition.x, runtimePosition.y, runtimePosition.z,
-            referencePosition.x, referencePosition.y, referencePosition.z);
-    }
-    ++g_actualTraceSegmentCount;
-
     constexpr std::size_t kMaxActualTracePoints = 2048;
+    if (g_actualWorldPath.size() >= kMaxActualTracePoints) {
+        return;
+    }
     const auto& previous = g_actualWorldPath.back();
     const auto dx = position.x - previous.x;
     const auto dy = position.y - previous.y;
@@ -733,10 +724,23 @@ void TrajectoryRenderer::RecordActualProjectilePosition(
     if (dx * dx + dy * dy + dz * dz > 0.01f) {
         g_actualWorldPath.push_back(position);
     }
-    if (g_actualWorldPath.size() > kMaxActualTracePoints) {
-        const auto removeCount = g_actualWorldPath.size() - kMaxActualTracePoints;
-        g_actualWorldPath.erase(g_actualWorldPath.begin(), g_actualWorldPath.begin() + removeCount);
+}
+
+void TrajectoryRenderer::SetActualTraceVisible(bool visible)
+{
+    g_actualTraceVisible.store(visible, std::memory_order_relaxed);
+    if (visible) {
+        return;
     }
+    std::scoped_lock lock(g_pathMutex);
+    g_tracedProjectile = nullptr;
+    g_actualWorldPath.clear();
+    g_screenActualPath.clear();
+}
+
+bool TrajectoryRenderer::IsActualTraceVisible()
+{
+    return g_actualTraceVisible.load(std::memory_order_relaxed);
 }
 
 void TrajectoryRenderer::Clear()
