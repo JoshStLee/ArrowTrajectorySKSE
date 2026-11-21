@@ -24,10 +24,10 @@ namespace
     std::filesystem::path GetSettingsPath()
     {
         if (const auto logDirectory = SKSE::log::log_directory()) {
-            return *logDirectory / "ArrowTrajectory.ini";
+            return *logDirectory / "LineOFireSKSE.ini";
         }
 
-        const auto module = REX::W32::GetModuleHandleW(L"ArrowTrajectory.dll");
+        const auto module = REX::W32::GetModuleHandleW(L"LineOFireSKSE.dll");
         if (!module) {
             return {};
         }
@@ -41,7 +41,7 @@ namespace
             return {};
         }
 
-        return std::filesystem::path(modulePath.data()).parent_path() / L"ArrowTrajectory.ini";
+        return std::filesystem::path(modulePath.data()).parent_path() / L"LineOFireSKSE.ini";
     }
 
     bool ReadTraceVisibility()
@@ -147,7 +147,7 @@ void TrajectorySettings::RegisterMenu()
     }
 
     // AddSectionItem accepts a full slash-separated path; this is equivalent
-    // to SetSection("Arrow Trajectory") followed by AddSectionItem("Visibility").
-    g_addSectionItem("Arrow Trajectory/Visibility", RenderVisibilityPage);
+    // to SetSection("Line-o-Fire") followed by AddSectionItem("Visibility").
+    g_addSectionItem("Line-o-Fire/Visibility", RenderVisibilityPage);
     g_menuRegistered = true;
 }

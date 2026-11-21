@@ -5,6 +5,6 @@
 
 namespace Plugin
 {
-    inline constexpr std::string_view NAME = "ArrowTrajectorySKSE";
+    inline constexpr std::string_view NAME = "LineOFireSKSESKSE";
     inline constexpr REL::Version VERSION{ 1, 0, 0, 0 };
 }

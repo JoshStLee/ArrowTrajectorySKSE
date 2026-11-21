@@ -250,18 +250,32 @@ namespace
         RE::Projectile::LaunchData& launchData) noexcept
     {
         TrajectoryPrediction::CorrectMountedArrowLaunchData(launchData);
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const bool playerMountedArrow = player && player->IsOnMount() &&
+            launchData.shooter == player && launchData.weaponSource && launchData.ammoSource;
         const bool correctedMountedSpell = Trajectory::CorrectMountedSpellLaunchData(launchData);
         if (!g_originalProjectileLaunch) {
             return nullptr;
         }
 
         auto* launchedHandle = g_originalProjectileLaunch(result, launchData);
-        if (correctedMountedSpell && launchedHandle) {
+        if ((playerMountedArrow || correctedMountedSpell) && launchedHandle) {
             auto launchedProjectile = launchedHandle->get();
             auto* projectile = launchedProjectile.get();
-            if (projectile && TrajectoryPrediction::CorrectMountedSpellProjectileVelocity(projectile, launchData)) {
+            if (projectile && playerMountedArrow) {
+                if (auto* arrow = skyrim_cast<RE::ArrowProjectile*>(projectile)) {
+                    InstallArrowProjectileUpdateHook(arrow);
+                    if (TrajectoryRenderer::IsActualTraceVisible() &&
+                        !TrajectoryRenderer::IsTracingProjectile(arrow)) {
+                        TrajectoryRenderer::BeginActualProjectileTrace(arrow, &launchData.origin);
+                    }
+                }
+            }
+            if (projectile && correctedMountedSpell &&
+                TrajectoryPrediction::CorrectMountedSpellProjectileVelocity(projectile, launchData)) {
                 InstallMountedSpellProjectileUpdateHook(projectile);
-                if (TrajectoryRenderer::IsActualTraceVisible()) {
+                if (TrajectoryRenderer::IsActualTraceVisible() &&
+                    !TrajectoryRenderer::IsTracingProjectile(projectile)) {
                     TrajectoryRenderer::BeginActualProjectileTrace(projectile, &launchData.origin);
                 }
             }
