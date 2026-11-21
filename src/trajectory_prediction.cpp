@@ -1,8 +1,10 @@
 #include "pch.h"
 #include "trajectory_prediction.h"
 #include "trajectory_renderer.h"
+#include "trajectory_settings.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <optional>
@@ -338,6 +340,99 @@ namespace
         return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
     }
 
+    using ProfileClock = std::chrono::steady_clock;
+
+    struct ArrowPredictionProfileWindow
+    {
+        ProfileClock::time_point startedAt{};
+        std::chrono::nanoseconds predictionTotal{};
+        std::chrono::nanoseconds pickObjectTotal{};
+        std::chrono::nanoseconds maxPrediction{};
+        std::chrono::nanoseconds maxPickObject{};
+        std::uint64_t updates{};
+        std::uint64_t raycasts{};
+    };
+
+    void RecordArrowPredictionProfileSample(
+        std::chrono::nanoseconds predictionTime,
+        std::chrono::nanoseconds pickObjectTime,
+        std::chrono::nanoseconds maxPickObjectTime,
+        std::uint64_t raycasts)
+    {
+        static ArrowPredictionProfileWindow window;
+        const auto now = ProfileClock::now();
+        if (window.updates == 0) {
+            window.startedAt = now;
+        }
+
+        ++window.updates;
+        window.raycasts += raycasts;
+        window.predictionTotal += predictionTime;
+        window.pickObjectTotal += pickObjectTime;
+        window.maxPrediction = (std::max)(window.maxPrediction, predictionTime);
+        window.maxPickObject = (std::max)(window.maxPickObject, maxPickObjectTime);
+
+        const auto windowDuration = now - window.startedAt;
+        if (windowDuration < std::chrono::seconds(5)) {
+            return;
+        }
+
+        const auto updates = static_cast<double>(window.updates);
+        const auto rays = static_cast<double>(window.raycasts);
+        const auto averagePredictionUs =
+            std::chrono::duration<double, std::micro>(window.predictionTotal).count() / updates;
+        const auto averagePickUs = window.raycasts > 0
+            ? std::chrono::duration<double, std::micro>(window.pickObjectTotal).count() / rays
+            : 0.0;
+        const auto averageRaycastsPerUpdate = rays / updates;
+        const auto totalPickUsPerUpdate =
+            std::chrono::duration<double, std::micro>(window.pickObjectTotal).count() / updates;
+        logger::info(
+            "Arrow prediction profile: {:.1f}s, {} updates, avg={:.1f}us max={:.1f}us, "
+            "PickObject avg={:.1f}us max={:.1f}us, {:.1f} raycasts/update, PickObject total={:.1f}us/update",
+            std::chrono::duration<double>(windowDuration).count(),
+            window.updates,
+            averagePredictionUs,
+            std::chrono::duration<double, std::micro>(window.maxPrediction).count(),
+            averagePickUs,
+            std::chrono::duration<double, std::micro>(window.maxPickObject).count(),
+            averageRaycastsPerUpdate,
+            totalPickUsPerUpdate);
+        window = {};
+    }
+
+    struct ArrowPredictionProfileSample
+    {
+        explicit ArrowPredictionProfileSample(bool enabled) :
+            enabled(enabled),
+            startedAt(enabled ? ProfileClock::now() : ProfileClock::time_point{})
+        {}
+
+        ~ArrowPredictionProfileSample()
+        {
+            if (enabled) {
+                RecordArrowPredictionProfileSample(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - startedAt),
+                    pickObjectTime,
+                    maxPickObjectTime,
+                    raycasts);
+            }
+        }
+
+        void RecordPickObject(std::chrono::nanoseconds elapsed)
+        {
+            pickObjectTime += elapsed;
+            maxPickObjectTime = (std::max)(maxPickObjectTime, elapsed);
+            ++raycasts;
+        }
+
+        bool enabled;
+        ProfileClock::time_point startedAt;
+        std::chrono::nanoseconds pickObjectTime{};
+        std::chrono::nanoseconds maxPickObjectTime{};
+        std::uint64_t raycasts{};
+    };
+
     RE::Setting* GetBowTiltSetting()
     {
         static auto* setting = [] {
@@ -382,7 +477,8 @@ namespace
         const RaycastContext& context,
         const PhysicsVector& start,
         const PhysicsVector& end,
-        std::uint64_t collisionMask = kSmoothCamCollisionMask)
+        std::uint64_t collisionMask = kSmoothCamCollisionMask,
+        ArrowPredictionProfileSample* profile = nullptr)
     {
         if (!context.world) {
             return std::nullopt;
@@ -399,7 +495,12 @@ namespace
         FirstHitCollector collector(context.player3D, context.mount3D, collisionMask);
         collector.Reset();
         pickData.closestRayHitCollector = &collector;
+        const auto pickStartedAt = profile ? ProfileClock::now() : ProfileClock::time_point{};
         context.world->PickObject(pickData);
+        if (profile) {
+            profile->RecordPickObject(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                ProfileClock::now() - pickStartedAt));
+        }
 
         if (!collector.hasHit) {
             return std::nullopt;
@@ -513,6 +614,7 @@ namespace
         PhysicsVector& impact,
         const char*& failureReason)
     {
+        ArrowPredictionProfileSample profile(TrajectorySettings::IsArrowPredictionProfilingEnabled());
         // A preview is frame-local launch state. If this frame cannot produce
         // one, a later mounted release must fall back instead of reusing an
         // aim vector from an earlier camera position or riding direction.
@@ -632,7 +734,8 @@ namespace
                     raycastContext,
                     previous,
                     position,
-                    kArrowPredictionCollisionMask)) {
+                    kArrowPredictionCollisionMask,
+                    profile.enabled ? &profile : nullptr)) {
                 impact = *hit;
                 path.push_back(ToNi(*hit));
                 return true;

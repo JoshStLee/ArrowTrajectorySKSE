@@ -16,6 +16,7 @@ namespace
     using CheckboxFunction = bool(*)(const char*, bool*);
 
     bool g_menuRegistered = false;
+    bool g_arrowPredictionProfilingEnabled = false;
     AddSectionItemFunction g_addSectionItem = nullptr;
     CheckboxFunction g_checkbox = nullptr;
     std::filesystem::path g_settingsPath;
@@ -61,6 +62,24 @@ namespace
         return true;
     }
 
+    bool ReadArrowPredictionProfiling()
+    {
+        if (g_settingsPath.empty()) {
+            return false;
+        }
+        std::ifstream settings(g_settingsPath);
+        std::string line;
+        while (std::getline(settings, line)) {
+            if (line == "ProfileArrowPrediction=0") {
+                return false;
+            }
+            if (line == "ProfileArrowPrediction=1") {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void SaveTraceVisibility(bool visible)
     {
         if (g_settingsPath.empty()) {
@@ -69,6 +88,7 @@ namespace
         std::ofstream settings(g_settingsPath, std::ios::trunc);
         if (settings) {
             settings << "ShowActualTrace=" << (visible ? '1' : '0') << '\n';
+            settings << "ProfileArrowPrediction=" << (g_arrowPredictionProfilingEnabled ? '1' : '0') << '\n';
         }
     }
 
@@ -90,6 +110,12 @@ void TrajectorySettings::Initialize()
 {
     g_settingsPath = GetSettingsPath();
     TrajectoryRenderer::SetActualTraceVisible(ReadTraceVisibility());
+    g_arrowPredictionProfilingEnabled = ReadArrowPredictionProfiling();
+}
+
+bool TrajectorySettings::IsArrowPredictionProfilingEnabled()
+{
+    return g_arrowPredictionProfilingEnabled;
 }
 
 void TrajectorySettings::RegisterMenu()
